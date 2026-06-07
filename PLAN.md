@@ -257,7 +257,7 @@
 ## 12. 项目目录结构（混合架构）
 
 ```
-trade_system/
+candleforge/
 ├── proto/                       # gRPC 契约（Go/Python 共享，单一事实源）
 │   └── quant.proto              # RunBacktest（当前核心方法）
 │
