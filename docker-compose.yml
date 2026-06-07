@@ -26,6 +26,8 @@ services:
     build:
       context: .
       dockerfile: quant-py/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     environment:
       GRPC_ADDR: "[::]:50051"
     ports:
@@ -35,6 +37,8 @@ services:
     build:
       context: .
       dockerfile: backend-go/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     environment:
       HTTP_ADDR: ":8080"
       QUANT_ADDR: "quant-py:50051"
@@ -55,6 +59,8 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     ports:
       - "5173:80"
     depends_on:

@@ -3,6 +3,10 @@ FROM golang:1.23 AS builder
 
 WORKDIR /src
 
+# 可选 GOPROXY（默认官方；网络受限时用 --build-arg GOPROXY=... 注入）
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+
 # 先拷贝 go.mod/go.sum 利用缓存
 COPY backend-go/go.mod backend-go/go.sum ./backend-go/
 WORKDIR /src/backend-go
