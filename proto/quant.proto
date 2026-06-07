@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package quant.v1;
+
+option go_package = "github.com/jiangbohhh/candleforge/backend-go/pb;pb";
+
+// QuantService 是 Python 回测服务对外暴露的 gRPC 接口。
+// Go 主服务作为客户端调用；当前 M0 阶段仅打通骨架。
+service QuantService {
+  // Ping 健康检查，验证 Go <-> Python gRPC 链路连通。
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // RunBacktest 运行一次回测：Go 传入历史 K 线 + 策略参数，
+  // Python 用 backtrader 跑完返回绩效与净值曲线。
+  // M0 阶段为占位实现，返回桩数据。
+  rpc RunBacktest(BacktestRequest) returns (BacktestResponse);
+}
+
+message PingRequest {
+  string message = 1;
+}
+
+message PingResponse {
+  string message = 1;
+  string service = 2; // 回应方服务名，便于确认是 Python 端
+}
+
+// 单根 K 线（OHLCV）。时间用 Unix 毫秒时间戳（UTC）。
+message Kline {
+  int64 open_time = 1;
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+  double volume = 6;
+}
+
+message BacktestRequest {
+  string symbol = 1;          // 如 CRYPTO.BTC-USDT
+  string strategy = 2;        // 策略名，如 "dual_ma"
+  map<string, string> params = 3; // 策略参数（字符串键值，Python 端解析）
+  double initial_cash = 4;    // 初始资金
+  double commission = 5;      // 手续费率
+  repeated Kline klines = 6;  // 历史 K 线序列
+}
+
+// 回测绩效指标。
+message BacktestMetrics {
+  double total_return = 1;    // 总收益率
+  double annual_return = 2;   // 年化收益率
+  double max_drawdown = 3;    // 最大回撤
+  double sharpe = 4;          // 夏普比率
+  int64 trade_count = 5;      // 成交次数
+  double win_rate = 6;        // 胜率
+}
+
+// 净值曲线上的一个点。
+message EquityPoint {
+  int64 time = 1;
+  double value = 2;
+}
+
+message BacktestResponse {
+  BacktestMetrics metrics = 1;
+  repeated EquityPoint equity_curve = 2;
+}

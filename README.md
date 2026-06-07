@@ -89,17 +89,45 @@ candleforge/
 
 ## 🚀 快速开始
 
-> 🚧 项目处于早期开发阶段（M0 脚手架）。以下为规划中的启动方式。
+> 🚧 当前为 **M0 脚手架**：三端骨架 + gRPC 打通 + 容器化。功能将随里程碑推进。
+
+### 方式一：Docker Compose（推荐）
 
 ```bash
-# 本地开发：一键拉起全栈
-docker compose up
+cp .env.example .env
+docker compose up --build
 
-# 前端       → http://localhost:5173
-# 后端 API   → http://localhost:8080
+# 前端自检页 → http://localhost:5173
+# 后端 API   → http://localhost:8080/healthz
 ```
 
-K8s 部署（规划中）：
+打开前端页面点击「运行连通检查」，可验证 **Go ↔ PostgreSQL** 与 **Go ↔ Python gRPC** 三端连通。
+
+### 方式二：本地分别启动（开发调试）
+
+```bash
+# 1) 数据库
+docker compose up -d postgres
+
+# 2) Python 回测服务
+cd quant-py && pip install grpcio grpcio-tools && python server.py
+
+# 3) Go 主服务
+cd backend-go && go run ./cmd/server
+
+# 4) 前端
+cd frontend && npm install && npm run dev
+```
+
+### 重新生成 gRPC 代码
+
+修改 `proto/quant.proto` 后：
+
+```bash
+bash proto/gen.sh   # 同时生成 Go 与 Python 的 pb 代码
+```
+
+### K8s 部署（规划中）
 
 ```bash
 helm install candleforge ./deploy/helm

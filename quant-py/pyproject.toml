@@ -1,0 +1,20 @@
+[project]
+name = "candleforge-quant"
+version = "0.1.0"
+description = "CandleForge Python 回测服务（backtrader），通过 gRPC 被 Go 主服务调用"
+requires-python = ">=3.11"
+dependencies = [
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    # M2 回测阶段加入：
+    # "backtrader>=1.9",
+    # "pandas>=2.0",
+    # "numpy>=1.26",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pb", "backtest", "strategies"]

@@ -1,0 +1,11 @@
+.git
+.claude
+**/node_modules
+**/dist
+**/__pycache__
+*.log
+.env
+.env.*
+!.env.example
+frontend/node_modules
+backend-go/bin
