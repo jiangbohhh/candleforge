@@ -4,15 +4,19 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/jiangbohhh/candleforge/backend-go/internal/grpcclient"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
+	"github.com/jiangbohhh/candleforge/backend-go/pb"
 )
 
 // Server 持有 HTTP 处理器所需的依赖。
@@ -48,6 +52,11 @@ func (s *Server) Router() *gin.Engine {
 	r.GET("/api/watchlist", s.getWatchlist)
 	r.POST("/api/watchlist", s.addWatch)
 	r.DELETE("/api/watchlist/:symbol", s.removeWatch)
+
+	// 回测
+	r.POST("/api/backtest", s.runBacktest)
+	r.GET("/api/backtest/runs", s.listBacktestRuns)
+	r.GET("/api/backtest/runs/:id", s.getBacktestRun)
 
 	// 管理
 	r.POST("/api/admin/backfill", s.triggerBackfill)
@@ -166,6 +175,134 @@ func (s *Server) removeWatch(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ── 回测 ──
+
+// protoMarshaler 用 protojson 输出干净 JSON（camelCase，无内部字段）。
+var protoMarshaler = protojson.MarshalOptions{EmitUnpopulated: true, UseProtoNames: false}
+
+func (s *Server) runBacktest(c *gin.Context) {
+	var body struct {
+		Symbol      string            `json:"symbol"`
+		Strategy    string            `json:"strategy"`
+		Interval    string            `json:"interval"`
+		Params      map[string]string `json:"params"`
+		InitialCash float64           `json:"initialCash"`
+		Commission  float64           `json:"commission"`
+		Limit       int               `json:"limit"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Symbol == "" || body.Strategy == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "symbol and strategy required"})
+		return
+	}
+	if body.Interval == "" {
+		body.Interval = "1h"
+	}
+	if body.Limit <= 0 {
+		body.Limit = 500
+	}
+	if body.InitialCash <= 0 {
+		body.InitialCash = 10000
+	}
+
+	ctx := c.Request.Context()
+	klines, err := s.store.GetKlines(ctx, body.Symbol, body.Interval, body.Limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(klines) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no klines for symbol/interval; run backfill first"})
+		return
+	}
+
+	pbKlines := make([]*pb.Kline, len(klines))
+	for i, k := range klines {
+		pbKlines[i] = &pb.Kline{
+			OpenTime: k.OpenTime, Open: k.Open, High: k.High,
+			Low: k.Low, Close: k.Close, Volume: k.Volume,
+		}
+	}
+
+	resp, err := s.quant.RunBacktest(ctx, &pb.BacktestRequest{
+		Symbol: body.Symbol, Strategy: body.Strategy, Params: body.Params,
+		InitialCash: body.InitialCash, Commission: body.Commission, Klines: pbKlines,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "backtest failed: " + err.Error()})
+		return
+	}
+
+	// protojson 序列化各部分用于落库与返回
+	metricsJSON, _ := protoMarshaler.Marshal(resp.GetMetrics())
+	equityJSON := marshalList(len(resp.GetEquityCurve()), func(i int) any {
+		b, _ := protoMarshaler.Marshal(resp.GetEquityCurve()[i])
+		return json.RawMessage(b)
+	})
+	tradesJSON := marshalList(len(resp.GetTrades()), func(i int) any {
+		b, _ := protoMarshaler.Marshal(resp.GetTrades()[i])
+		return json.RawMessage(b)
+	})
+	paramsJSON, _ := json.Marshal(body.Params)
+
+	id, err := s.store.InsertBacktestRun(ctx, store.BacktestRun{
+		Symbol: body.Symbol, Strategy: body.Strategy, Interval: body.Interval,
+		Params: paramsJSON, Metrics: metricsJSON,
+		EquityCurve: equityJSON, Trades: tradesJSON,
+		InitialCash: body.InitialCash, Commission: body.Commission,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":          id,
+		"symbol":      body.Symbol,
+		"strategy":    body.Strategy,
+		"interval":    body.Interval,
+		"metrics":     json.RawMessage(metricsJSON),
+		"equityCurve": json.RawMessage(equityJSON),
+		"trades":      json.RawMessage(tradesJSON),
+	})
+}
+
+func (s *Server) listBacktestRuns(c *gin.Context) {
+	runs, err := s.store.ListBacktestRuns(c.Request.Context(), 50)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, runs)
+}
+
+func (s *Server) getBacktestRun(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad id"})
+		return
+	}
+	run, err := s.store.GetBacktestRun(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, run)
+}
+
+// marshalList 把 n 个元素拼成 JSON 数组的 RawMessage。
+func marshalList(n int, get func(i int) any) json.RawMessage {
+	items := make([]any, n)
+	for i := 0; i < n; i++ {
+		items[i] = get(i)
+	}
+	b, _ := json.Marshal(items)
+	return b
 }
 
 // ── 管理 ──

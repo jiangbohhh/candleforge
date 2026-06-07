@@ -1,17 +1,25 @@
 import { useEffect, useRef } from 'react'
-import { createChart, CandlestickSeries, type IChartApi } from 'lightweight-charts'
-import type { Kline } from '../api/client'
+import {
+  createChart,
+  CandlestickSeries,
+  createSeriesMarkers,
+  type IChartApi,
+} from 'lightweight-charts'
+import type { Kline, BacktestTrade } from '../api/client'
 
 interface Props {
   klines: Kline[]
+  trades?: BacktestTrade[] // 可选：在 K 线上标买卖点
 }
 
-// KlineChart 用 TradingView Lightweight Charts 渲染蜡烛图。
-export default function KlineChart({ klines }: Props) {
+// KlineChart 用 TradingView Lightweight Charts 渲染蜡烛图，可选标记买卖点。
+export default function KlineChart({ klines, trades }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const seriesRef = useRef<any>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const markersRef = useRef<any>(null)
 
   // 初始化图表（一次）
   useEffect(() => {
@@ -61,6 +69,26 @@ export default function KlineChart({ klines }: Props) {
     seriesRef.current.setData(data)
     chartRef.current?.timeScale().fitContent()
   }, [klines])
+
+  // 买卖点标记（v5 用 createSeriesMarkers，非 series.setMarkers）
+  useEffect(() => {
+    if (!seriesRef.current) return
+    const markers = (trades ?? []).map((t) => {
+      const buy = t.side === 'buy'
+      return {
+        time: Math.floor(Number(t.time) / 1000) as never,
+        position: (buy ? 'belowBar' : 'aboveBar') as 'belowBar' | 'aboveBar',
+        color: buy ? '#26a69a' : '#ef5350',
+        shape: (buy ? 'arrowUp' : 'arrowDown') as 'arrowUp' | 'arrowDown',
+        text: buy ? 'B' : 'S',
+      }
+    })
+    if (markersRef.current) {
+      markersRef.current.setMarkers(markers)
+    } else {
+      markersRef.current = createSeriesMarkers(seriesRef.current, markers)
+    }
+  }, [trades])
 
   return <div ref={containerRef} style={{ width: '100%' }} />
 }

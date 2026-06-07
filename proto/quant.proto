@@ -60,7 +60,16 @@ message EquityPoint {
   double value = 2;
 }
 
+// 一笔成交（用于在 K 线图上标买卖点）。
+message Trade {
+  int64 time = 1;       // Unix 毫秒（与 Kline.open_time 同口径）
+  string side = 2;      // "buy" / "sell"
+  double price = 3;     // 成交价
+  double quantity = 4;  // 成交数量
+}
+
 message BacktestResponse {
   BacktestMetrics metrics = 1;
   repeated EquityPoint equity_curve = 2;
+  repeated Trade trades = 3;
 }

@@ -424,17 +424,87 @@ func (x *EquityPoint) GetValue() float64 {
 	return 0
 }
 
+// 一笔成交（用于在 K 线图上标买卖点）。
+type Trade struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Time          int64                  `protobuf:"varint,1,opt,name=time,proto3" json:"time,omitempty"`          // Unix 毫秒（与 Kline.open_time 同口径）
+	Side          string                 `protobuf:"bytes,2,opt,name=side,proto3" json:"side,omitempty"`           // "buy" / "sell"
+	Price         float64                `protobuf:"fixed64,3,opt,name=price,proto3" json:"price,omitempty"`       // 成交价
+	Quantity      float64                `protobuf:"fixed64,4,opt,name=quantity,proto3" json:"quantity,omitempty"` // 成交数量
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Trade) Reset() {
+	*x = Trade{}
+	mi := &file_quant_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Trade) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Trade) ProtoMessage() {}
+
+func (x *Trade) ProtoReflect() protoreflect.Message {
+	mi := &file_quant_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Trade.ProtoReflect.Descriptor instead.
+func (*Trade) Descriptor() ([]byte, []int) {
+	return file_quant_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *Trade) GetTime() int64 {
+	if x != nil {
+		return x.Time
+	}
+	return 0
+}
+
+func (x *Trade) GetSide() string {
+	if x != nil {
+		return x.Side
+	}
+	return ""
+}
+
+func (x *Trade) GetPrice() float64 {
+	if x != nil {
+		return x.Price
+	}
+	return 0
+}
+
+func (x *Trade) GetQuantity() float64 {
+	if x != nil {
+		return x.Quantity
+	}
+	return 0
+}
+
 type BacktestResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Metrics       *BacktestMetrics       `protobuf:"bytes,1,opt,name=metrics,proto3" json:"metrics,omitempty"`
 	EquityCurve   []*EquityPoint         `protobuf:"bytes,2,rep,name=equity_curve,json=equityCurve,proto3" json:"equity_curve,omitempty"`
+	Trades        []*Trade               `protobuf:"bytes,3,rep,name=trades,proto3" json:"trades,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BacktestResponse) Reset() {
 	*x = BacktestResponse{}
-	mi := &file_quant_proto_msgTypes[6]
+	mi := &file_quant_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -446,7 +516,7 @@ func (x *BacktestResponse) String() string {
 func (*BacktestResponse) ProtoMessage() {}
 
 func (x *BacktestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_quant_proto_msgTypes[6]
+	mi := &file_quant_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -459,7 +529,7 @@ func (x *BacktestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BacktestResponse.ProtoReflect.Descriptor instead.
 func (*BacktestResponse) Descriptor() ([]byte, []int) {
-	return file_quant_proto_rawDescGZIP(), []int{6}
+	return file_quant_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *BacktestResponse) GetMetrics() *BacktestMetrics {
@@ -472,6 +542,13 @@ func (x *BacktestResponse) GetMetrics() *BacktestMetrics {
 func (x *BacktestResponse) GetEquityCurve() []*EquityPoint {
 	if x != nil {
 		return x.EquityCurve
+	}
+	return nil
+}
+
+func (x *BacktestResponse) GetTrades() []*Trade {
+	if x != nil {
+		return x.Trades
 	}
 	return nil
 }
@@ -515,10 +592,16 @@ const file_quant_proto_rawDesc = "" +
 	"\bwin_rate\x18\x06 \x01(\x01R\awinRate\"7\n" +
 	"\vEquityPoint\x12\x12\n" +
 	"\x04time\x18\x01 \x01(\x03R\x04time\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x01R\x05value\"\x81\x01\n" +
+	"\x05value\x18\x02 \x01(\x01R\x05value\"a\n" +
+	"\x05Trade\x12\x12\n" +
+	"\x04time\x18\x01 \x01(\x03R\x04time\x12\x12\n" +
+	"\x04side\x18\x02 \x01(\tR\x04side\x12\x14\n" +
+	"\x05price\x18\x03 \x01(\x01R\x05price\x12\x1a\n" +
+	"\bquantity\x18\x04 \x01(\x01R\bquantity\"\xaa\x01\n" +
 	"\x10BacktestResponse\x123\n" +
 	"\ametrics\x18\x01 \x01(\v2\x19.quant.v1.BacktestMetricsR\ametrics\x128\n" +
-	"\fequity_curve\x18\x02 \x03(\v2\x15.quant.v1.EquityPointR\vequityCurve2\x8b\x01\n" +
+	"\fequity_curve\x18\x02 \x03(\v2\x15.quant.v1.EquityPointR\vequityCurve\x12'\n" +
+	"\x06trades\x18\x03 \x03(\v2\x0f.quant.v1.TradeR\x06trades2\x8b\x01\n" +
 	"\fQuantService\x125\n" +
 	"\x04Ping\x12\x15.quant.v1.PingRequest\x1a\x16.quant.v1.PingResponse\x12D\n" +
 	"\vRunBacktest\x12\x19.quant.v1.BacktestRequest\x1a\x1a.quant.v1.BacktestResponseB4Z2github.com/jiangbohhh/candleforge/backend-go/pb;pbb\x06proto3"
@@ -535,7 +618,7 @@ func file_quant_proto_rawDescGZIP() []byte {
 	return file_quant_proto_rawDescData
 }
 
-var file_quant_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_quant_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_quant_proto_goTypes = []any{
 	(*PingRequest)(nil),      // 0: quant.v1.PingRequest
 	(*PingResponse)(nil),     // 1: quant.v1.PingResponse
@@ -543,23 +626,25 @@ var file_quant_proto_goTypes = []any{
 	(*BacktestRequest)(nil),  // 3: quant.v1.BacktestRequest
 	(*BacktestMetrics)(nil),  // 4: quant.v1.BacktestMetrics
 	(*EquityPoint)(nil),      // 5: quant.v1.EquityPoint
-	(*BacktestResponse)(nil), // 6: quant.v1.BacktestResponse
-	nil,                      // 7: quant.v1.BacktestRequest.ParamsEntry
+	(*Trade)(nil),            // 6: quant.v1.Trade
+	(*BacktestResponse)(nil), // 7: quant.v1.BacktestResponse
+	nil,                      // 8: quant.v1.BacktestRequest.ParamsEntry
 }
 var file_quant_proto_depIdxs = []int32{
-	7, // 0: quant.v1.BacktestRequest.params:type_name -> quant.v1.BacktestRequest.ParamsEntry
+	8, // 0: quant.v1.BacktestRequest.params:type_name -> quant.v1.BacktestRequest.ParamsEntry
 	2, // 1: quant.v1.BacktestRequest.klines:type_name -> quant.v1.Kline
 	4, // 2: quant.v1.BacktestResponse.metrics:type_name -> quant.v1.BacktestMetrics
 	5, // 3: quant.v1.BacktestResponse.equity_curve:type_name -> quant.v1.EquityPoint
-	0, // 4: quant.v1.QuantService.Ping:input_type -> quant.v1.PingRequest
-	3, // 5: quant.v1.QuantService.RunBacktest:input_type -> quant.v1.BacktestRequest
-	1, // 6: quant.v1.QuantService.Ping:output_type -> quant.v1.PingResponse
-	6, // 7: quant.v1.QuantService.RunBacktest:output_type -> quant.v1.BacktestResponse
-	6, // [6:8] is the sub-list for method output_type
-	4, // [4:6] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	6, // 4: quant.v1.BacktestResponse.trades:type_name -> quant.v1.Trade
+	0, // 5: quant.v1.QuantService.Ping:input_type -> quant.v1.PingRequest
+	3, // 6: quant.v1.QuantService.RunBacktest:input_type -> quant.v1.BacktestRequest
+	1, // 7: quant.v1.QuantService.Ping:output_type -> quant.v1.PingResponse
+	7, // 8: quant.v1.QuantService.RunBacktest:output_type -> quant.v1.BacktestResponse
+	7, // [7:9] is the sub-list for method output_type
+	5, // [5:7] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_quant_proto_init() }
@@ -573,7 +658,7 @@ func file_quant_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_quant_proto_rawDesc), len(file_quant_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

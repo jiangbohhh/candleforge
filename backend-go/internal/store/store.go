@@ -4,6 +4,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"time"
 )
 
 // Store 持有数据库连接。
@@ -181,4 +183,78 @@ func (s *Store) RemoveWatch(ctx context.Context, symbol string) error {
 // Ping 校验数据库连通。
 func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
+}
+
+// ── backtest_runs ──
+
+type BacktestRun struct {
+	ID          int64           `json:"id"`
+	Symbol      string          `json:"symbol"`
+	Strategy    string          `json:"strategy"`
+	Interval    string          `json:"interval"`
+	Params      json.RawMessage `json:"params"`
+	Metrics     json.RawMessage `json:"metrics"`
+	EquityCurve json.RawMessage `json:"equityCurve,omitempty"`
+	Trades      json.RawMessage `json:"trades,omitempty"`
+	InitialCash float64         `json:"initialCash"`
+	Commission  float64         `json:"commission"`
+	CreatedAt   time.Time       `json:"createdAt"`
+}
+
+// InsertBacktestRun 写入一条回测记录，返回新 id。
+func (s *Store) InsertBacktestRun(ctx context.Context, r BacktestRun) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO backtest_runs
+			(symbol, strategy, interval, params, metrics, equity_curve, trades, initial_cash, commission)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		RETURNING id`,
+		r.Symbol, r.Strategy, r.Interval, r.Params, r.Metrics,
+		r.EquityCurve, r.Trades, r.InitialCash, r.Commission).Scan(&id)
+	return id, err
+}
+
+// ListBacktestRuns 返回历史回测列表（不含 equity_curve/trades，轻量）。
+func (s *Store) ListBacktestRuns(ctx context.Context, limit int) ([]BacktestRun, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, symbol, strategy, interval, params, metrics, initial_cash, commission, created_at
+		FROM backtest_runs ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []BacktestRun
+	for rows.Next() {
+		var r BacktestRun
+		var initCash, comm sql.NullFloat64
+		if err := rows.Scan(&r.ID, &r.Symbol, &r.Strategy, &r.Interval,
+			&r.Params, &r.Metrics, &initCash, &comm, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		r.InitialCash = initCash.Float64
+		r.Commission = comm.Float64
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetBacktestRun 返回单条回测记录（含 equity_curve/trades）。
+func (s *Store) GetBacktestRun(ctx context.Context, id int64) (BacktestRun, error) {
+	var r BacktestRun
+	var initCash, comm sql.NullFloat64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, symbol, strategy, interval, params, metrics, equity_curve, trades, initial_cash, commission, created_at
+		FROM backtest_runs WHERE id=$1`, id).Scan(
+		&r.ID, &r.Symbol, &r.Strategy, &r.Interval, &r.Params, &r.Metrics,
+		&r.EquityCurve, &r.Trades, &initCash, &comm, &r.CreatedAt)
+	if err != nil {
+		return r, err
+	}
+	r.InitialCash = initCash.Float64
+	r.Commission = comm.Float64
+	return r, nil
 }

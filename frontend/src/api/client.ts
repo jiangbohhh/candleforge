@@ -39,6 +39,59 @@ export interface Ticker {
 }
 
 // ── REST ──
+// ── 回测 ──
+export interface BacktestMetrics {
+  totalReturn: number
+  annualReturn: number
+  maxDrawdown: number
+  sharpe: number
+  tradeCount: number
+  winRate: number
+}
+
+export interface EquityPoint {
+  time: number | string // protojson 的 int64 可能是 string
+  value: number
+}
+
+export interface BacktestTrade {
+  time: number | string
+  side: 'buy' | 'sell'
+  price: number
+  quantity: number
+}
+
+export interface BacktestResult {
+  id: number
+  symbol: string
+  strategy: string
+  interval: string
+  metrics: BacktestMetrics
+  equityCurve: EquityPoint[]
+  trades: BacktestTrade[]
+}
+
+export interface BacktestRunSummary {
+  id: number
+  symbol: string
+  strategy: string
+  interval: string
+  metrics: BacktestMetrics
+  initialCash: number
+  commission: number
+  createdAt: string
+}
+
+export interface RunBacktestBody {
+  symbol: string
+  strategy: string
+  interval: string
+  params: Record<string, string>
+  initialCash: number
+  commission: number
+  limit?: number
+}
+
 export const api = {
   listSymbols: () => http.get<Symbol[]>('/api/symbols').then((r) => r.data),
   getKlines: (symbol: string, interval: string, limit = 500) =>
@@ -50,6 +103,13 @@ export const api = {
   addWatch: (symbol: string) => http.post('/api/watchlist', { symbol }),
   removeWatch: (symbol: string) =>
     http.delete(`/api/watchlist/${encodeURIComponent(symbol)}`),
+
+  runBacktest: (body: RunBacktestBody) =>
+    http.post<BacktestResult>('/api/backtest', body).then((r) => r.data),
+  listRuns: () =>
+    http.get<BacktestRunSummary[]>('/api/backtest/runs').then((r) => r.data),
+  getRun: (id: number) =>
+    http.get<BacktestResult>(`/api/backtest/runs/${id}`).then((r) => r.data),
 }
 
 // ── WebSocket（实时 ticker）──

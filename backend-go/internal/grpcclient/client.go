@@ -43,3 +43,10 @@ func (c *QuantClient) Ping(ctx context.Context, msg string) (*pb.PingResponse, e
 	defer cancel()
 	return c.client.Ping(ctx, &pb.PingRequest{Message: msg})
 }
+
+// RunBacktest 调用 Python 回测服务（回测较慢，超时 60s）。
+func (c *QuantClient) RunBacktest(ctx context.Context, req *pb.BacktestRequest) (*pb.BacktestResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	return c.client.RunBacktest(ctx, req)
+}

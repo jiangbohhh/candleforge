@@ -6,10 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
-    # M2 回测阶段加入：
-    # "backtrader>=1.9",
-    # "pandas>=2.0",
-    # "numpy>=1.26",
+    "backtrader==1.9.78.123",
+    "numpy==1.26.4",  # 必须 <2：numpy 2.0 删了 np.bool 等，backtrader 会崩
+    "pandas==2.2.3",
 ]
 
 [build-system]

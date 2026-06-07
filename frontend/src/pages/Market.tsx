@@ -13,13 +13,18 @@ import {
 } from 'antd'
 import { api, connectWS, type Kline, type Symbol, type Ticker } from '../api/client'
 import KlineChart from '../components/KlineChart'
+import TopNav, { type Tab } from '../components/TopNav'
 
 const { Header, Content, Sider } = Layout
-const { Title, Text } = Typography
+const { Text } = Typography
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d']
 
-export default function Market() {
+interface Props {
+  onNav: (t: Tab) => void
+}
+
+export default function Market({ onNav }: Props) {
   const [symbols, setSymbols] = useState<Symbol[]>([])
   const [watchlist, setWatchlist] = useState<string[]>([])
   const [tickers, setTickers] = useState<Record<string, Ticker>>({})
@@ -96,10 +101,7 @@ export default function Market() {
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Header style={{ background: '#001529', display: 'flex', alignItems: 'center' }}>
-        <Title level={3} style={{ color: '#fff', margin: 0 }}>
-          🕯️🔨 CandleForge
-        </Title>
-        <Text style={{ color: '#8c8c8c', marginLeft: 16 }}>行情看板</Text>
+        <TopNav active="market" onNav={onNav} />
       </Header>
       <Layout>
         <Sider width={340} style={{ background: '#fff', padding: 16 }}>
