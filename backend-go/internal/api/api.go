@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -23,21 +24,25 @@ import (
 
 // Server 持有 HTTP 处理器所需的依赖。
 type Server struct {
-	db     *sql.DB
-	store  *store.Store
-	quant  *grpcclient.QuantClient
-	src    market.MarketDataSource
-	live   *market.LiveFeed
-	hub    *ws.Hub
-	broker broker.Broker
-	risk   *risk.Engine
+	db      *sql.DB
+	store   *store.Store
+	quant   *grpcclient.QuantClient
+	src     market.MarketDataSource
+	live    *market.LiveFeed
+	hub     *ws.Hub
+	brokers map[string]broker.Broker // account.broker → Broker 实例
+	risk    *risk.Engine
+	envInfo map[string]string // 给 /api/brokers 用，如 {"binance":"testnet"}
 }
 
-// New 构造 API server。
+// New 构造 API server。brokers 至少包含 "sim"。如果 BinanceBroker 启用则加 "binance"。
 func New(db *sql.DB, st *store.Store, quant *grpcclient.QuantClient,
 	src market.MarketDataSource, live *market.LiveFeed, hub *ws.Hub,
-	br broker.Broker, riskEngine *risk.Engine) *Server {
-	return &Server{db: db, store: st, quant: quant, src: src, live: live, hub: hub, broker: br, risk: riskEngine}
+	brokers map[string]broker.Broker, riskEngine *risk.Engine, envInfo map[string]string) *Server {
+	return &Server{
+		db: db, store: st, quant: quant, src: src, live: live, hub: hub,
+		brokers: brokers, risk: riskEngine, envInfo: envInfo,
+	}
 }
 
 // Router 构建并返回 Gin 路由。
@@ -66,7 +71,8 @@ func (s *Server) Router() *gin.Engine {
 	// 管理
 	r.POST("/api/admin/backfill", s.triggerBackfill)
 
-	// 模拟交易 (M3)
+	// 模拟交易 (M3) + 实盘 (M4)
+	r.GET("/api/brokers", s.listBrokers)
 	r.GET("/api/account", s.getAccount)
 	r.GET("/api/account/summary", s.getAccountSummary)
 	r.POST("/api/orders", s.placeOrder)
@@ -335,15 +341,33 @@ func (s *Server) triggerBackfill(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"status": "backfill started"})
 }
 
-// ── 模拟交易 (M3) ──
+// ── 模拟交易 (M3) + 实盘 (M4) ──
 
-func (s *Server) simAccountID(c *gin.Context) (int64, error) {
-	ctx := c.Request.Context()
-	acct, err := s.store.EnsureSimAccount(ctx, "default", 100000)
-	if err != nil {
-		return 0, err
+// resolveAccount 把请求中的 ?account=default|live 解析成 (*Account, Broker)。
+// 缺省走 sim 账户，向后兼容 M3 调用。
+func (s *Server) resolveAccount(c *gin.Context) (*store.Account, broker.Broker, error) {
+	name := c.Query("account")
+	if name == "" {
+		name = "default"
 	}
-	return acct.ID, nil
+	ctx := c.Request.Context()
+
+	var acct *store.Account
+	var err error
+	if name == "default" {
+		// 兜底创建，保证 sim 账户始终可用
+		acct, err = s.store.EnsureSimAccount(ctx, "default", 100000)
+	} else {
+		acct, err = s.store.GetAccountByName(ctx, name)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("account %q not found: %w", name, err)
+	}
+	br, ok := s.brokers[acct.Broker]
+	if !ok {
+		return nil, nil, fmt.Errorf("no broker available for %q (kind=%s)", name, acct.Broker)
+	}
+	return acct, br, nil
 }
 
 func (s *Server) priceLookup(symbol string) float64 {
@@ -355,19 +379,62 @@ func (s *Server) priceLookup(symbol string) float64 {
 	return 0
 }
 
-func (s *Server) getAccount(c *gin.Context) {
-	acct, err := s.store.EnsureSimAccount(c.Request.Context(), "default", 100000)
+// BrokerInfo 是 /api/brokers 返回项。
+type BrokerInfo struct {
+	Name      string `json:"name"`      // default / live
+	Kind      string `json:"kind"`      // sim / live
+	Broker    string `json:"broker"`    // sim / binance
+	Available bool   `json:"available"` // brokers map 里是否有对应实例
+	Env       string `json:"env,omitempty"`
+}
+
+func (s *Server) listBrokers(c *gin.Context) {
+	accounts, err := s.store.ListAccounts(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// 兜底：若 default 还没创建（首次启动），强制创建一次再列。
+	if !hasAccountNamed(accounts, "default") {
+		_, _ = s.store.EnsureSimAccount(c.Request.Context(), "default", 100000)
+		accounts, _ = s.store.ListAccounts(c.Request.Context())
+	}
+	out := make([]BrokerInfo, 0, len(accounts))
+	for _, a := range accounts {
+		_, ok := s.brokers[a.Broker]
+		info := BrokerInfo{
+			Name: a.Name, Kind: a.Kind, Broker: a.Broker, Available: ok,
+		}
+		if env, ok := s.envInfo[a.Broker]; ok {
+			info.Env = env
+		}
+		out = append(out, info)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func hasAccountNamed(list []store.Account, name string) bool {
+	for _, a := range list {
+		if a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) getAccount(c *gin.Context) {
+	acct, _, err := s.resolveAccount(c)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, acct)
 }
 
 func (s *Server) getAccountSummary(c *gin.Context) {
-	acct, err := s.store.EnsureSimAccount(c.Request.Context(), "default", 100000)
+	acct, _, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 	summary, err := s.store.AccountSummary(c.Request.Context(), acct.ID, s.priceLookup)
@@ -379,9 +446,9 @@ func (s *Server) getAccountSummary(c *gin.Context) {
 }
 
 func (s *Server) placeOrder(c *gin.Context) {
-	accountID, err := s.simAccountID(c)
+	acct, br, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -404,15 +471,15 @@ func (s *Server) placeOrder(c *gin.Context) {
 		body.Type = "market"
 	}
 
-	// Risk check
-	if err := s.risk.Validate(c.Request.Context(), accountID,
+	// Risk check (sim 和 live 共用同一引擎)
+	if err := s.risk.Validate(c.Request.Context(), acct.ID,
 		body.Symbol, body.Side, body.Type, body.Price, body.Quantity, s.priceLookup); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	ord, err := s.broker.PlaceOrder(c.Request.Context(), broker.PlaceOrderRequest{
-		AccountID: accountID,
+	ord, err := br.PlaceOrder(c.Request.Context(), broker.PlaceOrderRequest{
+		AccountID: acct.ID,
 		Symbol:    body.Symbol,
 		Side:      body.Side,
 		OrderType: body.Type,
@@ -432,12 +499,12 @@ func (s *Server) cancelOrder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad order id"})
 		return
 	}
-	accountID, err := s.simAccountID(c)
+	acct, br, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.broker.CancelOrder(c.Request.Context(), accountID, orderID); err != nil {
+	if err := br.CancelOrder(c.Request.Context(), acct.ID, orderID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -445,12 +512,12 @@ func (s *Server) cancelOrder(c *gin.Context) {
 }
 
 func (s *Server) listOrders(c *gin.Context) {
-	accountID, err := s.simAccountID(c)
+	acct, br, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	orders, err := s.broker.ListOrders(c.Request.Context(), accountID)
+	orders, err := br.ListOrders(c.Request.Context(), acct.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -459,12 +526,12 @@ func (s *Server) listOrders(c *gin.Context) {
 }
 
 func (s *Server) listPositions(c *gin.Context) {
-	accountID, err := s.simAccountID(c)
+	acct, br, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	positions, err := s.broker.GetPositions(c.Request.Context(), accountID)
+	positions, err := br.GetPositions(c.Request.Context(), acct.ID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -477,12 +544,12 @@ func (s *Server) listPositions(c *gin.Context) {
 }
 
 func (s *Server) listTrades(c *gin.Context) {
-	accountID, err := s.simAccountID(c)
+	acct, _, err := s.resolveAccount(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	trades, err := s.store.ListTrades(c.Request.Context(), accountID, 100)
+	trades, err := s.store.ListTrades(c.Request.Context(), acct.ID, 100)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

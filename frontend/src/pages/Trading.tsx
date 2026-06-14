@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
+  Badge,
   Button,
   Card,
   Col,
@@ -11,6 +12,7 @@ import {
   Modal,
   Radio,
   Row,
+  Segmented,
   Select,
   Space,
   Statistic,
@@ -23,7 +25,9 @@ import {
 import {
   api,
   connectWS,
+  type AccountName,
   type AccountSummary,
+  type BrokerInfo,
   type Order,
   type OrderSide,
   type OrderType,
@@ -45,6 +49,8 @@ interface Props {
 export default function Trading({ onNav }: Props) {
   const [symbols, setSymbols] = useState<Symbol[]>([])
   const [tickers, setTickers] = useState<Record<string, Ticker>>({})
+  const [brokers, setBrokers] = useState<BrokerInfo[]>([])
+  const [account, setAccount] = useState<AccountName>('default')
   const [summary, setSummary] = useState<AccountSummary | null>(null)
   const [orders, setOrders] = useState<Order[]>([])
   const [positions, setPositions] = useState<Position[]>([])
@@ -61,12 +67,16 @@ export default function Trading({ onNav }: Props) {
   const tickersRef = useRef(tickers)
   tickersRef.current = tickers
 
-  const refreshAll = async () => {
+  const isLive = account !== 'default'
+  const currentBroker = brokers.find((b) => b.name === account)
+  const liveAvailable = brokers.some((b) => b.kind === 'live' && b.available)
+
+  const refreshAll = async (acct: AccountName = account) => {
     const [sum, ords, poss, trs] = await Promise.all([
-      api.getAccountSummary().catch(() => null),
-      api.listOrders().catch(() => [] as Order[]),
-      api.listPositions().catch(() => [] as Position[]),
-      api.listTrades().catch(() => [] as Trade[]),
+      api.getAccountSummary(acct).catch(() => null),
+      api.listOrders(acct).catch(() => [] as Order[]),
+      api.listPositions(acct).catch(() => [] as Position[]),
+      api.listTrades(acct).catch(() => [] as Trade[]),
     ])
     if (sum) setSummary(sum)
     setOrders(ords)
@@ -82,24 +92,25 @@ export default function Trading({ onNav }: Props) {
       setTickers(m)
     })
     api.getRiskStatus().then(setRisk).catch(() => {})
-    refreshAll()
+    api.getBrokers().then(setBrokers).catch(() => {})
   }, [])
 
-  // 实时：ticker 更新价格；order/trade 触发数据刷新
+  useEffect(() => {
+    refreshAll(account)
+  }, [account])
+
+  // 实时：ticker 更新价格；order/trade 触发数据刷新（仅在当前激活账户下刷）
   useEffect(() => {
     const disconnect = connectWS({
       onTicker: (t) => {
         setTickers((prev) => ({ ...prev, [t.symbol]: t }))
       },
-      onOrder: () => {
-        refreshAll()
-      },
-      onTrade: () => {
-        refreshAll()
-      },
+      onOrder: () => refreshAll(),
+      onTrade: () => refreshAll(),
     })
     return disconnect
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account])
 
   const symbolOptions = useMemo(
     () =>
@@ -120,16 +131,50 @@ export default function Trading({ onNav }: Props) {
   const submitOrder = async () => {
     try {
       const values = await form.validateFields()
-      await api.placeOrder({
+      const payload = {
         symbol: values.symbol,
-        side: values.side,
-        type: values.type,
+        side: values.side as OrderSide,
+        type: values.type as OrderType,
         price: values.type === 'limit' ? Number(values.price) : undefined,
         quantity: Number(values.quantity),
-      })
-      message.success('下单成功')
-      form.resetFields(['quantity', 'price'])
-      refreshAll()
+      }
+
+      const place = async () => {
+        await api.placeOrder(payload, account)
+        message.success(isLive ? '实盘已下单' : '下单成功')
+        form.resetFields(['quantity', 'price'])
+        refreshAll()
+      }
+
+      if (isLive) {
+        Modal.confirm({
+          title: '⚠️  确认实盘下单',
+          okButtonProps: { danger: true },
+          okText: `${payload.side === 'buy' ? '买入' : '卖出'} ${payload.quantity} ${payload.symbol.replace('CRYPTO.', '')}`,
+          cancelText: '取消',
+          content: (
+            <div>
+              <p>
+                <Text strong>这是真金白银的实盘订单</Text>（环境：
+                <Text type={currentBroker?.env === 'mainnet' ? 'danger' : 'warning'}>
+                  {currentBroker?.env ?? 'unknown'}
+                </Text>
+                ）。
+              </p>
+              <p>
+                {payload.side === 'buy' ? '买入' : '卖出'} {payload.quantity}{' '}
+                {payload.symbol.replace('CRYPTO.', '')}，{payload.type === 'limit' ? `限价 ${payload.price}` : '市价'}。
+              </p>
+              <p>
+                预计金额 <Text strong>{estNotional.toFixed(2)} USDT</Text>。
+              </p>
+            </div>
+          ),
+          onOk: place,
+        })
+      } else {
+        await place()
+      }
     } catch (e) {
       const msg =
         (e as { response?: { data?: { error?: string } } })?.response?.data?.error ??
@@ -140,7 +185,7 @@ export default function Trading({ onNav }: Props) {
 
   const cancelOrder = async (id: number) => {
     try {
-      await api.cancelOrder(id)
+      await api.cancelOrder(id, account)
       message.success(`已撤单 #${id}`)
       refreshAll()
     } catch {
@@ -187,6 +232,27 @@ export default function Trading({ onNav }: Props) {
     return <Tag color={m.color}>{m.text}</Tag>
   }
 
+  const accountOptions = [
+    { label: '模拟盘 (100k 起)', value: 'default' as const },
+    ...(liveAvailable
+      ? [
+          {
+            label: (
+              <span>
+                <Badge color="red" /> 实盘
+                {brokers.find((b) => b.kind === 'live')?.env === 'testnet'
+                  ? ' · testnet'
+                  : ' · mainnet'}
+              </span>
+            ),
+            value: 'live' as const,
+          },
+        ]
+      : []),
+  ]
+
+  const dangerBorder = isLive ? '1px solid #ff4d4f' : undefined
+
   return (
     <Layout style={{ minHeight: '100vh' }}>
       <Header style={{ background: '#001529', display: 'flex', alignItems: 'center' }}>
@@ -201,27 +267,48 @@ export default function Trading({ onNav }: Props) {
             style={{ marginBottom: 12 }}
           />
         )}
+        {isLive && currentBroker?.env === 'mainnet' && (
+          <Alert
+            type="error"
+            showIcon
+            message="⚠️ 当前为主网实盘 — 任何下单都会真实成交，请谨慎。"
+            style={{ marginBottom: 12 }}
+          />
+        )}
 
         <Row gutter={[12, 12]}>
-          {/* 账户总览 */}
+          {/* 账户切换 + 总览 */}
           <Col span={24}>
-            <Card size="small">
-              <Row gutter={16}>
+            <Card size="small" style={{ border: dangerBorder }}>
+              <Row gutter={16} align="middle">
                 <Col span={6}>
-                  <Statistic
-                    title="账户总值 (USDT)"
-                    value={summary?.totalValue ?? 0}
-                    precision={2}
-                  />
+                  <Space direction="vertical" size={4}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      账户
+                    </Text>
+                    <Segmented
+                      options={accountOptions}
+                      value={account}
+                      onChange={(v) => setAccount(v as AccountName)}
+                    />
+                  </Space>
                 </Col>
                 <Col span={6}>
+                  <Statistic
+                    title={isLive ? '总值 (USDT, 实盘)' : '总值 (USDT)'}
+                    value={summary?.totalValue ?? 0}
+                    precision={2}
+                    valueStyle={isLive ? { color: '#cf1322' } : undefined}
+                  />
+                </Col>
+                <Col span={4}>
                   <Statistic
                     title="可用现金"
                     value={summary?.account?.cash ?? 0}
                     precision={2}
                   />
                 </Col>
-                <Col span={6}>
+                <Col span={4}>
                   <Statistic
                     title="浮动盈亏"
                     value={summary?.unrealized ?? 0}
@@ -231,19 +318,21 @@ export default function Trading({ onNav }: Props) {
                     }}
                   />
                 </Col>
-                <Col span={6}>
+                <Col span={4}>
                   <Space>
                     <Text>紧急停止</Text>
                     <Switch
                       checked={!!risk?.halted}
                       onChange={(checked) => confirmHalt(checked)}
                     />
-                    {risk && (
-                      <Text type="secondary" style={{ fontSize: 12 }}>
+                  </Space>
+                  {risk && (
+                    <div>
+                      <Text type="secondary" style={{ fontSize: 11 }}>
                         单笔上限 {risk.maxNotional > 0 ? risk.maxNotional.toLocaleString() : '∞'}
                       </Text>
-                    )}
-                  </Space>
+                    </div>
+                  )}
                 </Col>
               </Row>
             </Card>
@@ -251,7 +340,12 @@ export default function Trading({ onNav }: Props) {
 
           {/* 下单面板 */}
           <Col span={8}>
-            <Card title="下单" size="small">
+            <Card
+              title={isLive ? '实盘下单 ⚠️' : '模拟下单'}
+              size="small"
+              style={{ border: dangerBorder }}
+              headStyle={isLive ? { background: '#fff1f0' } : undefined}
+            >
               <Form
                 form={form}
                 layout="vertical"
@@ -316,10 +410,11 @@ export default function Trading({ onNav }: Props) {
                 <Button
                   type="primary"
                   block
-                  danger={side === 'sell'}
+                  danger={side === 'sell' || isLive}
                   onClick={submitOrder}
                   disabled={!!risk?.halted}
                 >
+                  {isLive ? '🔴 实盘 ' : ''}
                   {side === 'buy' ? '买入' : '卖出'} {symbol?.replace('CRYPTO.', '')}
                 </Button>
               </Form>
@@ -350,7 +445,7 @@ export default function Trading({ onNav }: Props) {
                     title: '均价',
                     dataIndex: 'avgPrice',
                     align: 'right',
-                    render: (v: number) => v.toFixed(2),
+                    render: (v: number) => (v > 0 ? v.toFixed(2) : '—'),
                   },
                   {
                     title: '现价',

@@ -92,13 +92,24 @@ export interface RunBacktestBody {
   limit?: number
 }
 
-// ── M3 模拟盘 ──
+// ── M3 模拟盘 / M4 实盘 ──
+export type AccountName = 'default' | 'live' | string
+
 export interface Account {
   id: number
   name: string
   kind: string
+  broker: string
   cash: number
   createdAt: string
+}
+
+export interface BrokerInfo {
+  name: AccountName
+  kind: string // sim | live
+  broker: string // sim | binance
+  available: boolean
+  env?: string // testnet | mainnet (live only)
 }
 
 export type OrderSide = 'buy' | 'sell'
@@ -179,15 +190,26 @@ export const api = {
   getRun: (id: number) =>
     http.get<BacktestResult>(`/api/backtest/runs/${id}`).then((r) => r.data),
 
-  // M3
-  getAccountSummary: () =>
-    http.get<AccountSummary>('/api/account/summary').then((r) => r.data),
-  listOrders: () => http.get<Order[]>('/api/orders').then((r) => r.data),
-  listPositions: () => http.get<Position[]>('/api/positions').then((r) => r.data),
-  listTrades: () => http.get<Trade[]>('/api/trades').then((r) => r.data),
-  placeOrder: (body: PlaceOrderBody) =>
-    http.post<Order>('/api/orders', body).then((r) => r.data),
-  cancelOrder: (id: number) => http.delete(`/api/orders/${id}`),
+  // M3 / M4
+  getBrokers: () => http.get<BrokerInfo[]>('/api/brokers').then((r) => r.data),
+  getAccountSummary: (account?: AccountName) =>
+    http
+      .get<AccountSummary>('/api/account/summary', { params: { account } })
+      .then((r) => r.data),
+  listOrders: (account?: AccountName) =>
+    http.get<Order[]>('/api/orders', { params: { account } }).then((r) => r.data),
+  listPositions: (account?: AccountName) =>
+    http
+      .get<Position[]>('/api/positions', { params: { account } })
+      .then((r) => r.data),
+  listTrades: (account?: AccountName) =>
+    http.get<Trade[]>('/api/trades', { params: { account } }).then((r) => r.data),
+  placeOrder: (body: PlaceOrderBody, account?: AccountName) =>
+    http
+      .post<Order>('/api/orders', body, { params: { account } })
+      .then((r) => r.data),
+  cancelOrder: (id: number, account?: AccountName) =>
+    http.delete(`/api/orders/${id}`, { params: { account } }),
 
   getRiskStatus: () => http.get<RiskStatus>('/api/risk/status').then((r) => r.data),
   setRiskHalt: (halt: boolean, reason = '') =>

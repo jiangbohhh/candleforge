@@ -47,6 +47,17 @@ services:
       DB_USER: ${DB_USER:-candleforge}
       DB_PASSWORD: ${DB_PASSWORD:-candleforge}
       DB_NAME: ${DB_NAME:-candleforge}
+      # M4 Binance live broker (M4); 任一为空即停用 live。
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      BINANCE_MAINNET: ${BINANCE_MAINNET:-false}
+      BINANCE_MAINNET_CONFIRM: ${BINANCE_MAINNET_CONFIRM:-}
+      BINANCE_REST_BASE: ${BINANCE_REST_BASE:-}
+      BINANCE_WS_BASE: ${BINANCE_WS_BASE:-}
+      # 容器到 Binance 不通时透传代理。
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-postgres,quant-py,redis,localhost,127.0.0.1}
     ports:
       - "8080:8080"
     depends_on:

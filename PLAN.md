@@ -205,10 +205,10 @@
 - 时间同步：Binance 对 timestamp 敏感，需校准服务器时间
 
 ### 8.3 实现清单
-- [ ] 定义统一 `Broker` 接口（与 SimBroker 同接口）
-- [ ] `BinanceBroker`：现货下单/撤单/查询，User Data Stream 同步
-- [ ] 订单回报与持仓同步
-- [ ] API 密钥安全：加密存储、最小权限(只开现货交易，不开提币)、IP 白名单
+- [x] 定义统一 `Broker` 接口（与 SimBroker 同接口）
+- [x] `BinanceBroker`：现货下单/撤单/查询，User Data Stream 同步
+- [x] 订单回报与持仓同步
+- [x] API 密钥安全：从 `.env` 读取（不入库）；testnet 默认，mainnet 需要二次确认 env
 
 > ⚠️ 实盘涉及真实资金，模拟盘充分验证后再开启，独立审批开关。
 > 💡 是否支持合约/杠杆：暂按现货设计，后续按需扩展。
@@ -247,7 +247,7 @@
 | **M1 数据+行情** | Go 接 Binance(REST+WS)采数→落库；Go 暴露 REST/WS；前端看板、自选 | 能看 BTC/ETH 等实时/历史行情 |
 | **M2 回测** | Go 取历史 K 线 → gRPC 传 Python backtrader 回测、示例策略、绩效报告页 | 能跑策略回测 |
 | **M3 模拟盘** | Go 撮合引擎、风控、模拟下单、持仓跟踪 | 能用模拟资金交易 ✅ |
-| **M4 实盘** | Go 接 Binance 现货全自动、密钥安全、告警 | 能实盘自动交易加密 |
+| **M4 实盘** | Go 接 Binance 现货全自动、密钥安全、告警 | 能实盘自动交易加密 ✅（testnet 默认/mainnet 二次确认） |
 | **未来** | A 股接入(数据/回测/QMT/半自动)、合约杠杆等 | 见 §14 |
 
 > **跨语言职责**：Go 负责主链路全部(数据/交易/Web/账户/风控)，Python 仅在 M2 被 gRPC 调用跑回测。M0 先打通 gRPC 骨架。
@@ -316,13 +316,14 @@ candleforge/
 - 数据库：**PostgreSQL**（Docker 跑）
 - 加密交易所：**Binance**；合约/杠杆暂不做，先现货
 - M3 模拟盘已落地：撮合引擎、订单/持仓/成交、风控（紧急停止 + 单笔名义额上限）、WebSocket 推送
+- M4 实盘已落地：BinanceBroker（testnet 默认，mainnet 二次确认）、User Data Stream 同步、API 密钥 `.env` 注入、sim/live 共存前端切换
 
 ### ❓ 仍待确认
 - 历史 K 线拉取范围（几个币种、多长时间、哪些周期）
 - 心里是否已有想先跑的策略
-- 实盘 API key 管理方式（环境变量 vs 加密入库）
+- 实盘后续增强方向：策略自动跑、ExchangeInfo 精度校验、告警通知
 
-> 当前阶段：**M3 已完成，准备进入 M4 实盘**。
+> 当前阶段：**M0–M4 全部完成**，进入后续增强迭代。
 
 ---
 

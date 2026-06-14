@@ -265,6 +265,7 @@ type Account struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Kind      string    `json:"kind"`
+	Broker    string    `json:"broker"`
 	Cash      float64   `json:"cash"`
 	CreatedAt time.Time `json:"createdAt"`
 }
@@ -272,8 +273,19 @@ type Account struct {
 func (s *Store) GetAccount(ctx context.Context, id int64) (*Account, error) {
 	var a Account
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, kind, cash, created_at FROM accounts WHERE id=$1`, id).Scan(
-		&a.ID, &a.Name, &a.Kind, &a.Cash, &a.CreatedAt)
+		`SELECT id, name, kind, broker, cash, created_at FROM accounts WHERE id=$1`, id).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Broker, &a.Cash, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (s *Store) GetAccountByName(ctx context.Context, name string) (*Account, error) {
+	var a Account
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, broker, cash, created_at FROM accounts WHERE name=$1`, name).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Broker, &a.Cash, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -282,19 +294,59 @@ func (s *Store) GetAccount(ctx context.Context, id int64) (*Account, error) {
 
 // EnsureSimAccount returns the existing sim account matching name, or creates a new one.
 func (s *Store) EnsureSimAccount(ctx context.Context, name string, initialCash float64) (*Account, error) {
-	// Try insert first (DO NOTHING if exists)
 	s.db.ExecContext(ctx,
-		`INSERT INTO accounts (name, kind, cash) VALUES ($1, 'sim', $2) ON CONFLICT DO NOTHING`,
+		`INSERT INTO accounts (name, kind, broker, cash) VALUES ($1,'sim','sim',$2) ON CONFLICT (name) DO NOTHING`,
 		name, initialCash)
 
 	var a Account
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, kind, cash, created_at FROM accounts WHERE name=$1 AND kind='sim'`, name).Scan(
-		&a.ID, &a.Name, &a.Kind, &a.Cash, &a.CreatedAt)
+		`SELECT id, name, kind, broker, cash, created_at FROM accounts WHERE name=$1 AND kind='sim'`, name).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Broker, &a.Cash, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &a, nil
+}
+
+// EnsureLiveAccount returns the live account for the given broker, or creates one with cash=0.
+// Cash will be synced from the exchange after creation.
+func (s *Store) EnsureLiveAccount(ctx context.Context, name, broker string) (*Account, error) {
+	s.db.ExecContext(ctx,
+		`INSERT INTO accounts (name, kind, broker, cash) VALUES ($1,'live',$2,0) ON CONFLICT (name) DO NOTHING`,
+		name, broker)
+
+	var a Account
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, broker, cash, created_at FROM accounts WHERE name=$1 AND kind='live'`, name).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Broker, &a.Cash, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, kind, broker, cash, created_at FROM accounts ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Account
+	for rows.Next() {
+		var a Account
+		if err := rows.Scan(&a.ID, &a.Name, &a.Kind, &a.Broker, &a.Cash, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// SetAccountCash overwrites the cash column for an account (used by Binance balance sync).
+func (s *Store) SetAccountCash(ctx context.Context, accountID int64, cash float64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET cash=$1 WHERE id=$2`, cash, accountID)
+	return err
 }
 
 // ── orders ──
@@ -309,16 +361,17 @@ type InsertOrderParams struct {
 }
 
 type OrderRow struct {
-	ID        int64     `json:"id"`
-	AccountID int64     `json:"accountId"`
-	Symbol    string    `json:"symbol"`
-	Side      string    `json:"side"`
-	OrderType string    `json:"orderType"`
-	Price     float64   `json:"price"`
-	Quantity  float64   `json:"quantity"`
-	FilledQty float64   `json:"filledQty"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID            int64     `json:"id"`
+	AccountID     int64     `json:"accountId"`
+	Symbol        string    `json:"symbol"`
+	Side          string    `json:"side"`
+	OrderType     string    `json:"orderType"`
+	Price         float64   `json:"price"`
+	Quantity      float64   `json:"quantity"`
+	FilledQty     float64   `json:"filledQty"`
+	Status        string    `json:"status"`
+	BrokerOrderID string    `json:"brokerOrderId,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // InsertOrder writes a new order and returns orderID, accountID.
@@ -342,16 +395,18 @@ func (s *Store) UpdateOrderStatus(ctx context.Context, id int64, status string) 
 func (s *Store) GetOrder(ctx context.Context, id int64) (*OrderRow, error) {
 	var o OrderRow
 	var price, filledQty sql.NullFloat64
+	var brokerOID sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, created_at
+		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, broker_order_id, created_at
 		 FROM orders WHERE id=$1`, id).Scan(
 		&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
-		&price, &o.Quantity, &filledQty, &o.Status, &o.CreatedAt)
+		&price, &o.Quantity, &filledQty, &o.Status, &brokerOID, &o.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	o.Price = price.Float64
 	o.FilledQty = filledQty.Float64
+	o.BrokerOrderID = brokerOID.String
 	return &o, nil
 }
 
@@ -360,7 +415,7 @@ func (s *Store) ListOrders(ctx context.Context, accountID int64, limit int) ([]O
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity, COALESCE(filled_qty,0), status, created_at
+		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity, COALESCE(filled_qty,0), status, COALESCE(broker_order_id,''), created_at
 		FROM orders WHERE account_id=$1
 		ORDER BY id DESC LIMIT $2`, accountID, limit)
 	if err != nil {
@@ -371,7 +426,7 @@ func (s *Store) ListOrders(ctx context.Context, accountID int64, limit int) ([]O
 	for rows.Next() {
 		var o OrderRow
 		if err := rows.Scan(&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
-			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.CreatedAt); err != nil {
+			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.BrokerOrderID, &o.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -534,4 +589,82 @@ func (s *Store) AccountSummary(ctx context.Context, accountID int64, priceFn fun
 		Unrealized: totalUnreal,
 		Positions:  positions,
 	}, nil
+}
+
+// ── M4 实盘辅助 ──
+
+// SetOrderBrokerOrderID 在 PlaceOrder 提交后把交易所返回的订单号写回本地行。
+func (s *Store) SetOrderBrokerOrderID(ctx context.Context, localID int64, brokerOrderID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE orders SET broker_order_id=$1 WHERE id=$2`, brokerOrderID, localID)
+	return err
+}
+
+// GetOrderByBrokerOrderID 用交易所订单号反查本地订单，供 UserDataStream 路由事件。
+func (s *Store) GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*OrderRow, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM orders WHERE broker_order_id=$1`, brokerOrderID).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetOrder(ctx, id)
+}
+
+// UpdateOrderFill 把状态和累计成交量一起写回，供 UDS executionReport 用。
+func (s *Store) UpdateOrderFill(ctx context.Context, localID int64, status string, filledQty float64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE orders SET status=$1, filled_qty=$2 WHERE id=$3`, status, filledQty, localID)
+	return err
+}
+
+// InsertTradeFull 写一行成交（用于 UDS 上报真实成交，带费率/时间）。
+func (s *Store) InsertTradeFull(ctx context.Context, orderID int64, symbol, side string, price, quantity, fee float64, tradedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO trades (order_id, symbol, side, price, quantity, fee, traded_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		orderID, symbol, side, price, quantity, fee, tradedAt)
+	return err
+}
+
+// UpsertPositionRaw 直接写入（覆盖）持仓数量与均价；不做加权融合。
+// 适合 Binance 余额初始同步与 outboundAccountPosition 事件。
+func (s *Store) UpsertPositionRaw(ctx context.Context, accountID int64, symbol string, quantity, avgPrice float64) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO positions (account_id, symbol, quantity, avg_price)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (account_id, symbol) DO UPDATE SET
+			quantity=EXCLUDED.quantity,
+			avg_price=CASE WHEN EXCLUDED.avg_price > 0 THEN EXCLUDED.avg_price ELSE positions.avg_price END,
+			updated_at=now()`,
+		accountID, symbol, quantity, avgPrice)
+	return err
+}
+
+// GetSymbolByNative 用交易所原生符号(BTCUSDT)反查统一符号(CRYPTO.BTC-USDT)。
+func (s *Store) GetSymbolByNative(ctx context.Context, native string) (*Symbol, error) {
+	var sym Symbol
+	err := s.db.QueryRowContext(ctx,
+		`SELECT symbol, market, base_asset, quote_asset, native_symbol, name, status
+		 FROM symbols WHERE native_symbol=$1`, native).Scan(
+		&sym.Symbol, &sym.Market, &sym.BaseAsset, &sym.QuoteAsset,
+		&sym.NativeSymbol, &sym.Name, &sym.Status)
+	if err != nil {
+		return nil, err
+	}
+	return &sym, nil
+}
+
+// GetSymbol 取统一符号对应的元数据。
+func (s *Store) GetSymbol(ctx context.Context, symbol string) (*Symbol, error) {
+	var sym Symbol
+	err := s.db.QueryRowContext(ctx,
+		`SELECT symbol, market, base_asset, quote_asset, native_symbol, name, status
+		 FROM symbols WHERE symbol=$1`, symbol).Scan(
+		&sym.Symbol, &sym.Market, &sym.BaseAsset, &sym.QuoteAsset,
+		&sym.NativeSymbol, &sym.Name, &sym.Status)
+	if err != nil {
+		return nil, err
+	}
+	return &sym, nil
 }

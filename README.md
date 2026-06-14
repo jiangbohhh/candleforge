@@ -82,15 +82,15 @@ candleforge/
 | **M1** 数据+行情 | Binance 采数、落库、行情看板、自选 | ✅ |
 | **M2** 回测 | backtrader 回测、示例策略、绩效报告 | ✅ |
 | **M3** 模拟盘 | 撮合引擎、风控、模拟下单、持仓跟踪 | ✅ |
-| **M4** 实盘 | Binance 现货全自动、密钥安全、告警 | ⬜ |
+| **M4** 实盘 | Binance 现货全自动、密钥安全、告警 | ✅ |
 | **未来** | A 股接入、合约/杠杆、多交易所 | 💡 |
 
 > 完整设计与决策记录见 [PLAN.md](PLAN.md)。
 
 ## 🚀 快速开始
 
-> ✅ 已落地：**M0 / M1 / M2 / M3**。当前可用 — 行情看板、策略回测、模拟盘交易（撮合 + 风控 + 紧急停止）。
-> 🚧 进行中：**M4** 实盘交易。
+> ✅ 已落地：**M0 / M1 / M2 / M3 / M4**。当前可用 — 行情看板、策略回测、模拟盘交易、Binance 实盘交易（testnet 默认 / mainnet 二次确认）。
+> 🚧 下一步：策略管理、多账户、告警通知。
 
 ### 方式一：Docker Compose（推荐）
 
@@ -103,6 +103,22 @@ docker compose up --build
 ```
 
 前端首页即可查看实时 K 线、运行回测、在「交易」页用模拟资金下单。
+
+### 启用 Binance 实盘（M4）
+
+1. 在 [testnet.binance.vision](https://testnet.binance.vision) 申请 API key（启用 Enable Spot Trading）。
+2. 填入 `.env`：
+   ```bash
+   BINANCE_API_KEY=your_testnet_key
+   BINANCE_API_SECRET=your_testnet_secret
+   # 主网请同时设置（任一缺失即停留 testnet）：
+   # BINANCE_MAINNET=true
+   # BINANCE_MAINNET_CONFIRM=I_UNDERSTAND_REAL_MONEY
+   ```
+3. `docker compose up -d --build backend-go` → 后端日志出现 `Binance live broker enabled: testnet`。
+4. 前端「交易」页顶部出现 `实盘 · testnet` 切换器；选中后下单需二次确认。
+
+> ⚠️ 容器若无法连通 Binance（GFW 等），在 `.env` 加 `HTTPS_PROXY=http://host.docker.internal:7890`（按本机代理端口改）。
 
 ### 方式二：本地分别启动（开发调试）
 

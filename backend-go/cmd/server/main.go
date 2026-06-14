@@ -77,8 +77,43 @@ func main() {
 	// 风控引擎：默认单笔上限 50,000 USDT，未启用紧急停止
 	riskEngine := risk.NewEngine(st, 50000)
 
+	// 实盘 Binance Broker (M4) — 仅在 BINANCE_API_KEY/SECRET 配置时构造
+	brokers := map[string]broker.Broker{"sim": simBroker}
+	envInfo := map[string]string{}
+	if cfg.LiveBrokerEnabled() {
+		// 主网必须二次确认；testnet 不需要。
+		if cfg.BinanceMainnet && cfg.BinanceConfirm != "I_UNDERSTAND_REAL_MONEY" {
+			log.Fatalf("BINANCE_MAINNET=true 需要 BINANCE_MAINNET_CONFIRM=I_UNDERSTAND_REAL_MONEY 显式确认实盘风险")
+		}
+
+		opts := broker.BinanceOptions{
+			APIKey:           cfg.BinanceAPIKey,
+			APISecret:        cfg.BinanceAPISecret,
+			Mainnet:          cfg.BinanceMainnet,
+			RESTBaseOverride: cfg.BinanceRESTBase,
+			WSBaseOverride:   cfg.BinanceWSBase,
+		}
+		liveAcct, err := st.EnsureLiveAccount(ctx, "live", "binance")
+		if err != nil {
+			log.Fatalf("ensure live account: %v", err)
+		}
+		bb, err := broker.NewBinanceBroker(ctx, st, hub, liveAcct.ID, opts)
+		if err != nil {
+			log.Fatalf("init Binance broker: %v", err)
+		}
+		brokers["binance"] = bb
+		envInfo["binance"] = opts.EnvLabel()
+		warn := ""
+		if opts.Mainnet {
+			warn = " ⚠️  MAINNET (real money)"
+		}
+		log.Printf("Binance live broker enabled: %s%s", opts.EnvLabel(), warn)
+	} else {
+		log.Printf("Binance live broker disabled (BINANCE_API_KEY missing); only sim available")
+	}
+
 	// HTTP 服务
-	srv := api.New(db, st, quant, src, live, hub, simBroker, riskEngine)
+	srv := api.New(db, st, quant, src, live, hub, brokers, riskEngine, envInfo)
 	if err := srv.Router().Run(cfg.HTTPAddr); err != nil {
 		log.Fatalf("http server: %v", err)
 	}
