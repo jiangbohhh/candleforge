@@ -89,7 +89,8 @@ candleforge/
 
 ## 🚀 快速开始
 
-> 🚧 当前为 **M0 脚手架**：三端骨架 + gRPC 打通 + 容器化。功能将随里程碑推进。
+> ✅ 已落地：**M0 / M1 / M2 / M3**。当前可用 — 行情看板、策略回测、模拟盘交易（撮合 + 风控 + 紧急停止）。
+> 🚧 进行中：**M4** 实盘交易。
 
 ### 方式一：Docker Compose（推荐）
 
@@ -97,11 +98,11 @@ candleforge/
 cp .env.example .env
 docker compose up --build
 
-# 前端自检页 → http://localhost:5173
-# 后端 API   → http://localhost:8080/healthz
+# 前端 → http://localhost:5173    （行情 / 回测 / 交易 三个 Tab）
+# 后端 → http://localhost:8080/healthz
 ```
 
-打开前端页面点击「运行连通检查」，可验证 **Go ↔ PostgreSQL** 与 **Go ↔ Python gRPC** 三端连通。
+前端首页即可查看实时 K 线、运行回测、在「交易」页用模拟资金下单。
 
 ### 方式二：本地分别启动（开发调试）
 
