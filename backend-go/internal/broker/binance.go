@@ -18,9 +18,9 @@ import (
 
 const (
 	BinanceTestnetRESTBase = "https://testnet.binance.vision"
-	BinanceTestnetWSBase   = "wss://testnet.binance.vision"
+	BinanceTestnetWSBase   = "wss://ws-api.testnet.binance.vision/ws-api/v3"
 	BinanceMainnetRESTBase = "https://api.binance.com"
-	BinanceMainnetWSBase   = "wss://stream.binance.com:9443"
+	BinanceMainnetWSBase   = "wss://ws-api.binance.com/ws-api/v3"
 )
 
 // BinanceOptions 构造 BinanceBroker 所需的参数。

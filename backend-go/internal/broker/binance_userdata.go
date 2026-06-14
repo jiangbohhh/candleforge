@@ -1,15 +1,27 @@
-// Package broker — Binance User Data Stream: 实时同步订单状态与账户余额。
-// 单条 WS goroutine + keepalive ticker；断线指数退避重连。
+// Package broker — Binance Spot User Data Stream over WebSocket API.
+//
+// Binance 在 2026-02-04 下线了旧的 listenKey 体系
+// (POST /api/v3/userDataStream / wss://stream.binance.com:9443/ws/<listenKey>).
+// 新方式：连接 ws-api/v3，发送 userDataStream.subscribe.signature 请求
+// （HMAC 签名 apiKey+timestamp），随后服务端推送的事件以
+// {"subscriptionId":N,"event":{"e":"executionReport",...}} 形式返回。
+//
+// 单条 WS goroutine；断线指数退避重连；gorilla/websocket 自动回 pong。
 package broker
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
@@ -40,41 +52,27 @@ func (u *userDataStream) run() {
 		default:
 		}
 
-		listenKey, err := u.broker.client.NewStartUserStreamService().Do(context.Background())
-		if err != nil {
-			log.Printf("binance UDS: get listenKey: %v; retry in %s", err, backoff)
+		if err := u.dialAndSubscribe(); err != nil {
+			log.Printf("binance UDS: %v; reconnect in %s", err, backoff)
 			if !sleepOrStop(u.stopCh, backoff) {
 				return
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		log.Printf("binance UDS: connected (%s)", maskKey(listenKey))
 		backoff = time.Second
-
-		if err := u.dialAndListen(listenKey); err != nil {
-			log.Printf("binance UDS: %v; reconnecting in %s", err, backoff)
-			if !sleepOrStop(u.stopCh, backoff) {
-				return
-			}
-			backoff = nextBackoff(backoff)
-		}
 	}
 }
 
-func (u *userDataStream) dialAndListen(listenKey string) error {
-	wsURL := u.broker.opts.wsBase() + "/ws/" + listenKey
+func (u *userDataStream) dialAndSubscribe() error {
+	wsURL := u.broker.opts.wsBase()
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("dial %s: %w", wsURL, err)
 	}
 	defer conn.Close()
 
-	ctxKA, cancelKA := context.WithCancel(context.Background())
-	defer cancelKA()
-	go u.keepalive(ctxKA, listenKey)
-
-	// 单独 goroutine 监听 stopCh 来唤醒阻塞中的 ReadMessage。
+	// 给读循环一个停车位：stopCh 触发就关连接，让 ReadMessage 出错返回。
 	stopReader := make(chan struct{})
 	defer close(stopReader)
 	go func() {
@@ -85,49 +83,83 @@ func (u *userDataStream) dialAndListen(listenKey string) error {
 		}
 	}()
 
+	// 发起 userDataStream.subscribe.signature
+	reqID := uuid.New().String()
+	ts := time.Now().UnixMilli()
+	payload := fmt.Sprintf("apiKey=%s&timestamp=%d", u.broker.opts.APIKey, ts)
+	sig := hmacSHA256Hex(u.broker.opts.APISecret, payload)
+
+	req := map[string]any{
+		"id":     reqID,
+		"method": "userDataStream.subscribe.signature",
+		"params": map[string]any{
+			"apiKey":    u.broker.opts.APIKey,
+			"timestamp": ts,
+			"signature": sig,
+		},
+	}
+	if err := conn.WriteJSON(req); err != nil {
+		return fmt.Errorf("send subscribe: %w", err)
+	}
+
+	log.Printf("binance UDS: subscribed to %s", wsURL)
 	for {
-		_, msg, err := conn.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
 		}
-		u.dispatch(msg)
+		u.dispatch(raw, reqID)
 	}
 }
 
-func (u *userDataStream) keepalive(ctx context.Context, listenKey string) {
-	ticker := time.NewTicker(30 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+func (u *userDataStream) dispatch(raw []byte, subscribeReqID string) {
+	// 三种消息：
+	// 1) {"id":"<req>", "status":200, "result":{"subscriptionId":N}} — 订阅 ack
+	// 2) {"id":"<req>", "status":XXX, "error":{...}} — 错误
+	// 3) {"subscriptionId":N, "event":{"e":"...", ...}} — 推送事件
+	var generic struct {
+		ID             string          `json:"id"`
+		Status         int             `json:"status"`
+		Result         json.RawMessage `json:"result"`
+		Error          json.RawMessage `json:"error"`
+		SubscriptionID *int64          `json:"subscriptionId"`
+		Event          json.RawMessage `json:"event"`
+	}
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return
+	}
+
+	if generic.ID == subscribeReqID {
+		if generic.Status != 200 {
+			log.Printf("binance UDS: subscribe rejected: %s", string(generic.Error))
 			return
-		case <-ticker.C:
-			if err := u.broker.client.NewKeepaliveUserStreamService().ListenKey(listenKey).Do(context.Background()); err != nil {
-				log.Printf("binance UDS keepalive: %v", err)
-			}
 		}
+		log.Printf("binance UDS: subscribe ack %s", string(generic.Result))
+		return
 	}
-}
 
-func (u *userDataStream) dispatch(msg []byte) {
+	if len(generic.Event) == 0 {
+		return // 既不是 ack 也不是 event（比如 session.status 回执），忽略。
+	}
+
 	var head struct {
 		E string `json:"e"`
 	}
-	if err := json.Unmarshal(msg, &head); err != nil {
+	if err := json.Unmarshal(generic.Event, &head); err != nil {
 		return
 	}
 	switch head.E {
 	case "executionReport":
-		u.handleExecutionReport(msg)
+		u.handleExecutionReport(generic.Event)
 	case "outboundAccountPosition":
-		u.handleAccountUpdate(msg)
+		u.handleAccountUpdate(generic.Event)
 	}
 }
 
-// executionReport 字段：参见 Binance Spot WS docs。
-// 主要字段：i=orderId, X=status, x=execType (NEW/TRADE/CANCELED...),
+// executionReport 字段：参见 Binance Spot WS API docs。
+// i=orderId, X=status, x=execType (NEW/TRADE/CANCELED...),
 // l=last fill qty, L=last fill price, z=cumulative filled qty, n=commission,
-// S=side, s=symbol(native), E=event time.
+// S=side, s=symbol(native), E=event time。
 func (u *userDataStream) handleExecutionReport(msg []byte) {
 	var r struct {
 		Symbol        string `json:"s"`
@@ -149,7 +181,7 @@ func (u *userDataStream) handleExecutionReport(msg []byte) {
 	ctx := context.Background()
 	local, err := u.broker.store.GetOrderByBrokerOrderID(ctx, brokerOID)
 	if err != nil {
-		// 可能是外部下单（不经过本服务），忽略。
+		// 外部下单（不经本服务）忽略。
 		return
 	}
 
@@ -243,9 +275,8 @@ func nextBackoff(d time.Duration) time.Duration {
 	return d
 }
 
-func maskKey(k string) string {
-	if len(k) <= 8 {
-		return "***"
-	}
-	return k[:6] + "..."
+func hmacSHA256Hex(secret, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
 }
