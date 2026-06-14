@@ -1,0 +1,2 @@
+-- M3 模拟盘：补充订单的累计成交量列
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS filled_qty NUMERIC NOT NULL DEFAULT 0;

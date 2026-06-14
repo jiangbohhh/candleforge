@@ -10,9 +10,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/jiangbohhh/candleforge/backend-go/internal/api"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/broker"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/config"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/grpcclient"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
 )
@@ -61,8 +63,22 @@ func main() {
 	live := market.NewLiveFeed(src, hub)
 	live.Start(ctx)
 
+	// 模拟盘撮合引擎 (M3)
+	priceFn := func(symbol string) float64 {
+		for _, t := range live.Snapshot() {
+			if t.Symbol == symbol {
+				return t.Price
+			}
+		}
+		return 0
+	}
+	simBroker := broker.NewSimBroker(db, st, priceFn, hub)
+
+	// 风控引擎：默认单笔上限 50,000 USDT，未启用紧急停止
+	riskEngine := risk.NewEngine(st, 50000)
+
 	// HTTP 服务
-	srv := api.New(db, st, quant, src, live, hub)
+	srv := api.New(db, st, quant, src, live, hub, simBroker, riskEngine)
 	if err := srv.Router().Run(cfg.HTTPAddr); err != nil {
 		log.Fatalf("http server: %v", err)
 	}

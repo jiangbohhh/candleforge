@@ -258,3 +258,280 @@ func (s *Store) GetBacktestRun(ctx context.Context, id int64) (BacktestRun, erro
 	r.Commission = comm.Float64
 	return r, nil
 }
+
+// ── accounts ──
+
+type Account struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	Cash      float64   `json:"cash"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (s *Store) GetAccount(ctx context.Context, id int64) (*Account, error) {
+	var a Account
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, cash, created_at FROM accounts WHERE id=$1`, id).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Cash, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// EnsureSimAccount returns the existing sim account matching name, or creates a new one.
+func (s *Store) EnsureSimAccount(ctx context.Context, name string, initialCash float64) (*Account, error) {
+	// Try insert first (DO NOTHING if exists)
+	s.db.ExecContext(ctx,
+		`INSERT INTO accounts (name, kind, cash) VALUES ($1, 'sim', $2) ON CONFLICT DO NOTHING`,
+		name, initialCash)
+
+	var a Account
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, kind, cash, created_at FROM accounts WHERE name=$1 AND kind='sim'`, name).Scan(
+		&a.ID, &a.Name, &a.Kind, &a.Cash, &a.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// ── orders ──
+
+type InsertOrderParams struct {
+	AccountID int64
+	Symbol    string
+	Side      string
+	OrderType string
+	Price     float64
+	Quantity  float64
+}
+
+type OrderRow struct {
+	ID        int64     `json:"id"`
+	AccountID int64     `json:"accountId"`
+	Symbol    string    `json:"symbol"`
+	Side      string    `json:"side"`
+	OrderType string    `json:"orderType"`
+	Price     float64   `json:"price"`
+	Quantity  float64   `json:"quantity"`
+	FilledQty float64   `json:"filledQty"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// InsertOrder writes a new order and returns orderID, accountID.
+func (s *Store) InsertOrder(ctx context.Context, p InsertOrderParams) (orderID, accountID int64, err error) {
+	var price interface{}
+	if p.OrderType == "limit" {
+		price = p.Price
+	}
+	err = s.db.QueryRowContext(ctx, `
+		INSERT INTO orders (account_id, symbol, side, type, price, quantity, status)
+		VALUES ($1,$2,$3,$4,$5,$6,'new')
+		RETURNING id, account_id`, p.AccountID, p.Symbol, p.Side, p.OrderType, price, p.Quantity).Scan(&orderID, &accountID)
+	return
+}
+
+func (s *Store) UpdateOrderStatus(ctx context.Context, id int64, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE orders SET status=$1 WHERE id=$2`, status, id)
+	return err
+}
+
+func (s *Store) GetOrder(ctx context.Context, id int64) (*OrderRow, error) {
+	var o OrderRow
+	var price, filledQty sql.NullFloat64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, created_at
+		 FROM orders WHERE id=$1`, id).Scan(
+		&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
+		&price, &o.Quantity, &filledQty, &o.Status, &o.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	o.Price = price.Float64
+	o.FilledQty = filledQty.Float64
+	return &o, nil
+}
+
+func (s *Store) ListOrders(ctx context.Context, accountID int64, limit int) ([]OrderRow, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity, COALESCE(filled_qty,0), status, created_at
+		FROM orders WHERE account_id=$1
+		ORDER BY id DESC LIMIT $2`, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OrderRow
+	for rows.Next() {
+		var o OrderRow
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
+			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// PendingOrder is a simplified view used by SimBroker for matching.
+type PendingOrder struct {
+	ID        int64
+	AccountID int64
+	Symbol    string
+	Side      string
+	Price    float64 // limit price
+	Quantity float64
+}
+
+func (s *Store) ListPendingLimitOrders(ctx context.Context) ([]PendingOrder, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, symbol, side, COALESCE(price,0), quantity
+		FROM orders WHERE type='limit' AND status='new'
+		ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingOrder
+	for rows.Next() {
+		var o PendingOrder
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.Price, &o.Quantity); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// ── positions ──
+
+type Position struct {
+	ID        int64   `json:"id"`
+	AccountID int64   `json:"accountId"`
+	Symbol    string  `json:"symbol"`
+	Quantity  float64 `json:"quantity"`
+	AvgPrice  float64 `json:"avgPrice"`
+}
+
+// PositionView is a position enriched with current market price.
+type PositionView struct {
+	Position
+	MarketPrice float64 `json:"marketPrice"`
+	Unrealized  float64 `json:"unrealized"`
+}
+
+func (s *Store) GetPosition(ctx context.Context, accountID int64, symbol string) (*Position, error) {
+	var p Position
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, account_id, symbol, quantity, avg_price FROM positions
+		 WHERE account_id=$1 AND symbol=$2`, accountID, symbol).Scan(
+		&p.ID, &p.AccountID, &p.Symbol, &p.Quantity, &p.AvgPrice)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s *Store) ListPositions(ctx context.Context, accountID int64) ([]PositionView, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, account_id, symbol, quantity, avg_price FROM positions
+		 WHERE account_id=$1 AND quantity > 0
+		 ORDER BY symbol`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PositionView
+	for rows.Next() {
+		var pv PositionView
+		if err := rows.Scan(&pv.ID, &pv.AccountID, &pv.Symbol, &pv.Quantity, &pv.AvgPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, pv)
+	}
+	return out, rows.Err()
+}
+
+// ── trades ──
+
+type TradeRow struct {
+	ID       int64     `json:"id"`
+	OrderID  int64     `json:"orderId"`
+	Symbol   string    `json:"symbol"`
+	Side     string    `json:"side"`
+	Price    float64   `json:"price"`
+	Quantity float64   `json:"quantity"`
+	Fee      float64   `json:"fee"`
+	TradedAt time.Time `json:"tradedAt"`
+}
+
+func (s *Store) ListTrades(ctx context.Context, accountID int64, limit int) ([]TradeRow, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.id, t.order_id, t.symbol, t.side, t.price, t.quantity, COALESCE(t.fee,0), t.traded_at
+		FROM trades t JOIN orders o ON t.order_id = o.id
+		WHERE o.account_id=$1
+		ORDER BY t.id DESC LIMIT $2`, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TradeRow
+	for rows.Next() {
+		var tr TradeRow
+		if err := rows.Scan(&tr.ID, &tr.OrderID, &tr.Symbol, &tr.Side, &tr.Price, &tr.Quantity, &tr.Fee, &tr.TradedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, tr)
+	}
+	return out, rows.Err()
+}
+
+// ── account summary ──
+
+type AccountSummary struct {
+	Account     *Account       `json:"account"`
+	TotalValue  float64        `json:"totalValue"`
+	Unrealized  float64        `json:"unrealized"`
+	Positions   []PositionView `json:"positions"`
+}
+
+// AccountSummary computes total value, unrealized P&L, and enriches positions with market prices.
+func (s *Store) AccountSummary(ctx context.Context, accountID int64, priceFn func(string) float64) (*AccountSummary, error) {
+	acct, err := s.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	positions, err := s.ListPositions(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		totalValue  float64
+		totalUnreal float64
+	)
+	for i := range positions {
+		mp := priceFn(positions[i].Symbol)
+		unrealized := (mp - positions[i].AvgPrice) * positions[i].Quantity
+		totalValue += mp * positions[i].Quantity
+		totalUnreal += unrealized
+		positions[i].MarketPrice = mp
+		positions[i].Unrealized = unrealized
+	}
+
+	return &AccountSummary{
+		Account:    acct,
+		TotalValue: acct.Cash + totalValue,
+		Unrealized: totalUnreal,
+		Positions:  positions,
+	}, nil
+}

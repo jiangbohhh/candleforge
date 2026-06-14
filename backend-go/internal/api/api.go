@@ -12,8 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/jiangbohhh/candleforge/backend-go/internal/broker"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/grpcclient"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
 	"github.com/jiangbohhh/candleforge/backend-go/pb"
@@ -21,18 +23,21 @@ import (
 
 // Server 持有 HTTP 处理器所需的依赖。
 type Server struct {
-	db    *sql.DB
-	store *store.Store
-	quant *grpcclient.QuantClient
-	src   market.MarketDataSource
-	live  *market.LiveFeed
-	hub   *ws.Hub
+	db     *sql.DB
+	store  *store.Store
+	quant  *grpcclient.QuantClient
+	src    market.MarketDataSource
+	live   *market.LiveFeed
+	hub    *ws.Hub
+	broker broker.Broker
+	risk   *risk.Engine
 }
 
 // New 构造 API server。
 func New(db *sql.DB, st *store.Store, quant *grpcclient.QuantClient,
-	src market.MarketDataSource, live *market.LiveFeed, hub *ws.Hub) *Server {
-	return &Server{db: db, store: st, quant: quant, src: src, live: live, hub: hub}
+	src market.MarketDataSource, live *market.LiveFeed, hub *ws.Hub,
+	br broker.Broker, riskEngine *risk.Engine) *Server {
+	return &Server{db: db, store: st, quant: quant, src: src, live: live, hub: hub, broker: br, risk: riskEngine}
 }
 
 // Router 构建并返回 Gin 路由。
@@ -60,6 +65,19 @@ func (s *Server) Router() *gin.Engine {
 
 	// 管理
 	r.POST("/api/admin/backfill", s.triggerBackfill)
+
+	// 模拟交易 (M3)
+	r.GET("/api/account", s.getAccount)
+	r.GET("/api/account/summary", s.getAccountSummary)
+	r.POST("/api/orders", s.placeOrder)
+	r.DELETE("/api/orders/:id", s.cancelOrder)
+	r.GET("/api/orders", s.listOrders)
+	r.GET("/api/positions", s.listPositions)
+	r.GET("/api/trades", s.listTrades)
+
+	// 风控
+	r.GET("/api/risk/status", s.getRiskStatus)
+	r.POST("/api/risk/halt", s.setRiskHalt)
 
 	// 前端实时 WS
 	r.GET("/ws", func(c *gin.Context) {
@@ -315,6 +333,188 @@ func (s *Server) triggerBackfill(c *gin.Context) {
 		_ = market.Backfill(ctx, s.store, s.src)
 	}()
 	c.JSON(http.StatusAccepted, gin.H{"status": "backfill started"})
+}
+
+// ── 模拟交易 (M3) ──
+
+func (s *Server) simAccountID(c *gin.Context) (int64, error) {
+	ctx := c.Request.Context()
+	acct, err := s.store.EnsureSimAccount(ctx, "default", 100000)
+	if err != nil {
+		return 0, err
+	}
+	return acct.ID, nil
+}
+
+func (s *Server) priceLookup(symbol string) float64 {
+	for _, t := range s.live.Snapshot() {
+		if t.Symbol == symbol {
+			return t.Price
+		}
+	}
+	return 0
+}
+
+func (s *Server) getAccount(c *gin.Context) {
+	acct, err := s.store.EnsureSimAccount(c.Request.Context(), "default", 100000)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, acct)
+}
+
+func (s *Server) getAccountSummary(c *gin.Context) {
+	acct, err := s.store.EnsureSimAccount(c.Request.Context(), "default", 100000)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	summary, err := s.store.AccountSummary(c.Request.Context(), acct.ID, s.priceLookup)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, summary)
+}
+
+func (s *Server) placeOrder(c *gin.Context) {
+	accountID, err := s.simAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var body struct {
+		Symbol   string  `json:"symbol"`
+		Side     string  `json:"side"`
+		Type     string  `json:"type"`
+		Price    float64 `json:"price"`
+		Quantity float64 `json:"quantity"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Symbol == "" || body.Side == "" || body.Quantity <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "symbol, side, quantity required"})
+		return
+	}
+	if body.Type == "" {
+		body.Type = "market"
+	}
+
+	// Risk check
+	if err := s.risk.Validate(c.Request.Context(), accountID,
+		body.Symbol, body.Side, body.Type, body.Price, body.Quantity, s.priceLookup); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ord, err := s.broker.PlaceOrder(c.Request.Context(), broker.PlaceOrderRequest{
+		AccountID: accountID,
+		Symbol:    body.Symbol,
+		Side:      body.Side,
+		OrderType: body.Type,
+		Price:     body.Price,
+		Quantity:  body.Quantity,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, ord)
+}
+
+func (s *Server) cancelOrder(c *gin.Context) {
+	orderID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad order id"})
+		return
+	}
+	accountID, err := s.simAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.broker.CancelOrder(c.Request.Context(), accountID, orderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (s *Server) listOrders(c *gin.Context) {
+	accountID, err := s.simAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	orders, err := s.broker.ListOrders(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, orders)
+}
+
+func (s *Server) listPositions(c *gin.Context) {
+	accountID, err := s.simAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	positions, err := s.broker.GetPositions(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for i := range positions {
+		positions[i].MarketPrice = s.priceLookup(positions[i].Symbol)
+		positions[i].Unrealized = (positions[i].MarketPrice - positions[i].AvgPrice) * positions[i].Quantity
+	}
+	c.JSON(http.StatusOK, positions)
+}
+
+func (s *Server) listTrades(c *gin.Context) {
+	accountID, err := s.simAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	trades, err := s.store.ListTrades(c.Request.Context(), accountID, 100)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, trades)
+}
+
+// ── 风控 ──
+
+func (s *Server) getRiskStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, s.risk.Status())
+}
+
+func (s *Server) setRiskHalt(c *gin.Context) {
+	var body struct {
+		Halt   bool   `json:"halt"`
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Halt {
+		reason := body.Reason
+		if reason == "" {
+			reason = "manual"
+		}
+		s.risk.Halt(reason)
+	} else {
+		s.risk.Unhalt()
+	}
+	c.JSON(http.StatusOK, s.risk.Status())
 }
 
 func atoiDefault(s string, def int) int {

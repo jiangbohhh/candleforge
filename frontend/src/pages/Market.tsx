@@ -48,8 +48,10 @@ export default function Market({ onNav }: Props) {
 
   // WebSocket 实时更新
   useEffect(() => {
-    const disconnect = connectWS((t) => {
-      setTickers((prev) => ({ ...prev, [t.symbol]: t }))
+    const disconnect = connectWS({
+      onTicker: (t) => {
+        setTickers((prev) => ({ ...prev, [t.symbol]: t }))
+      },
     })
     return disconnect
   }, [])
