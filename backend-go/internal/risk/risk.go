@@ -4,8 +4,10 @@ package risk
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 
+	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 )
 
@@ -116,12 +118,29 @@ func (e *Engine) Validate(ctx context.Context, accountID int64, symbol, side, or
 			return fmt.Errorf("insufficient cash: need %.8f, have %.8f", notional, acct.Cash)
 		}
 	case "sell":
-		pos, err := e.st.GetPosition(ctx, accountID, symbol)
-		if err != nil || pos == nil {
-			return fmt.Errorf("no position for %s", symbol)
-		}
-		if pos.Quantity < quantity {
-			return fmt.Errorf("insufficient quantity: have %.8f, want %.8f", pos.Quantity, quantity)
+		if market.IsPerp(symbol) {
+			// 永续允许卖出开空（1x 全额保证金）：超出现有多仓的部分按名义额校验现金。
+			// 注：sim 台账中空头开仓所得现金先入账，此处为近似校验；
+			// 策略级最坏占用预检（grid live Start）是主防线。
+			held := 0.0
+			if pos, err := e.st.GetPosition(ctx, accountID, symbol); err == nil && pos != nil {
+				held = math.Max(pos.Quantity, 0)
+			}
+			opening := quantity - held
+			if opening > 0 {
+				need := refPrice * opening
+				if acct.Cash < need {
+					return fmt.Errorf("insufficient margin for short: need %.8f, have %.8f", need, acct.Cash)
+				}
+			}
+		} else {
+			pos, err := e.st.GetPosition(ctx, accountID, symbol)
+			if err != nil || pos == nil {
+				return fmt.Errorf("no position for %s", symbol)
+			}
+			if pos.Quantity < quantity {
+				return fmt.Errorf("insufficient quantity: have %.8f, want %.8f", pos.Quantity, quantity)
+			}
 		}
 	}
 

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"time"
 
@@ -12,10 +13,12 @@ import (
 	"github.com/jiangbohhh/candleforge/backend-go/internal/api"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/broker"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/config"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/events"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/grpcclient"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/strategy"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
 )
 
@@ -48,8 +51,9 @@ func main() {
 	}
 	defer quant.Close()
 
-	// Binance 数据源
-	src := market.NewBinanceSource()
+	// Binance 数据源：现货(api) + USDT-M 永续(fapi)，按 .PERP 后缀路由
+	perpSrc := market.NewBinanceFuturesSource()
+	src := market.NewRouter(market.NewBinanceSource(), perpSrc)
 
 	// 预置标的 + 历史回填（空表才回填）
 	ctx := context.Background()
@@ -57,11 +61,29 @@ func main() {
 		log.Printf("seed/backfill warning: %v", err)
 	}
 
+	// 资金费率同步：启动增量 + 每 8h 一次（永续每 8h 结算一期）
+	syncFunding := func() {
+		if err := market.SyncFundingRates(ctx, st, perpSrc, time.Now().UnixMilli()); err != nil {
+			log.Printf("funding sync warning: %v", err)
+		}
+	}
+	syncFunding()
+	go func() {
+		t := time.NewTicker(8 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			syncFunding()
+		}
+	}()
+
 	// 实时行情：Binance ticker -> 缓存 -> 前端 WS Hub
 	hub := ws.NewHub()
 	go hub.Run()
 	live := market.NewLiveFeed(src, hub)
 	live.Start(ctx)
+
+	// 进程内事件总线（broker → 策略引擎）
+	eventBus := events.NewBus()
 
 	// 模拟盘撮合引擎 (M3)
 	priceFn := func(symbol string) float64 {
@@ -72,7 +94,7 @@ func main() {
 		}
 		return 0
 	}
-	simBroker := broker.NewSimBroker(db, st, priceFn, hub)
+	simBroker := broker.NewSimBroker(db, st, priceFn, hub, eventBus)
 
 	// 风控引擎：默认单笔上限 50,000 USDT，未启用紧急停止
 	riskEngine := risk.NewEngine(st, 50000)
@@ -97,7 +119,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("ensure live account: %v", err)
 		}
-		bb, err := broker.NewBinanceBroker(ctx, st, hub, liveAcct.ID, opts)
+		bb, err := broker.NewBinanceBroker(ctx, st, hub, eventBus, liveAcct.ID, opts)
 		if err != nil {
 			log.Fatalf("init Binance broker: %v", err)
 		}
@@ -112,8 +134,67 @@ func main() {
 		log.Printf("Binance live broker disabled (BINANCE_API_KEY missing); only sim available")
 	}
 
+	// USDT-M 永续 Broker (M6.5) — 仅在 BINANCE_FUTURES_API_KEY/SECRET 配置时构造。
+	// 合约 testnet 与现货 testnet 是两套独立密钥；主网复用同一对二次确认开关。
+	if cfg.FuturesBrokerEnabled() {
+		if cfg.BinanceMainnet && cfg.BinanceConfirm != "I_UNDERSTAND_REAL_MONEY" {
+			log.Fatalf("BINANCE_MAINNET=true 需要 BINANCE_MAINNET_CONFIRM=I_UNDERSTAND_REAL_MONEY 显式确认实盘风险")
+		}
+		fOpts := broker.BinanceFuturesOptions{
+			APIKey:    cfg.BinanceFuturesAPIKey,
+			APISecret: cfg.BinanceFuturesAPISecret,
+			Mainnet:   cfg.BinanceMainnet,
+		}
+		futAcct, err := st.EnsureLiveAccount(ctx, "live_futures", "binance_futures")
+		if err != nil {
+			log.Fatalf("ensure live_futures account: %v", err)
+		}
+		fb, err := broker.NewBinanceFuturesBroker(ctx, st, hub, eventBus, futAcct.ID, fOpts)
+		if err != nil {
+			log.Fatalf("init Binance futures broker: %v", err)
+		}
+		brokers["binance_futures"] = fb
+		envInfo["binance_futures"] = fOpts.EnvLabel()
+		warn := ""
+		if fOpts.Mainnet {
+			warn = " ⚠️  MAINNET (real money)"
+		}
+		log.Printf("Binance USDT-M futures broker enabled: %s%s", fOpts.EnvLabel(), warn)
+	} else {
+		log.Printf("Binance futures broker disabled (BINANCE_FUTURES_API_KEY missing)")
+	}
+
+	// BrokerFor 解析器：按 accountID 查 accounts 行，路由到对应 broker 实例。
+	// 当前实现：sim 子账户走共享 SimBroker；live 主账户走 brokers["binance"]（若有）。
+	// Phase D 后续迭代：live 子账户按 api_key 动态构建独立 BinanceBroker。
+	brokerFor := func(accountID int64) (broker.Broker, error) {
+		if accountID == 0 {
+			return simBroker, nil
+		}
+		acct, err := st.GetAccount(ctx, accountID)
+		if err != nil {
+			return nil, fmt.Errorf("account %d: %w", accountID, err)
+		}
+		if b, ok := brokers[acct.Broker]; ok {
+			return b, nil
+		}
+		// sub 账户的 broker 列跟随父账户
+		return simBroker, nil
+	}
+
+	// M6 策略引擎
+	mgr := strategy.NewManager(strategy.Env{
+		Store:   st,
+		Brokers: brokerFor,
+		Risk:    riskEngine,
+		PriceFn: priceFn,
+		Hub:     hub,
+	}, eventBus, cfg.MaxRunningStrategies)
+	mgr.ResumeAll(ctx)
+
 	// HTTP 服务
 	srv := api.New(db, st, quant, src, live, hub, brokers, riskEngine, envInfo)
+	srv.SetManager(mgr)
 	if err := srv.Router().Run(cfg.HTTPAddr); err != nil {
 		log.Fatalf("http server: %v", err)
 	}

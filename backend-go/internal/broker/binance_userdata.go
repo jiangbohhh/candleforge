@@ -203,15 +203,17 @@ func (u *userDataStream) handleExecutionReport(msg []byte) {
 		if err := u.broker.store.InsertTradeFull(ctx, local.ID, local.Symbol, side, lp, lq, fee, tradedAt); err != nil {
 			log.Printf("binance UDS: insert trade for order %d: %v", local.ID, err)
 		}
-		u.broker.broadcastEvent("trade", map[string]any{
-			"orderId":  local.ID,
-			"symbol":   local.Symbol,
-			"side":     side,
-			"price":    lp,
-			"quantity": lq,
-			"fee":      fee,
-			"tradedAt": tradedAt,
-		})
+		if u.broker.hub != nil {
+			u.broker.hub.BroadcastEvent("trade", map[string]any{
+				"orderId":  local.ID,
+				"symbol":   local.Symbol,
+				"side":     side,
+				"price":    lp,
+				"quantity": lq,
+				"fee":      fee,
+				"tradedAt": tradedAt,
+			})
+		}
 	}
 	u.broker.broadcastOrder(local.ID)
 }

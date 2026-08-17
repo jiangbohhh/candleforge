@@ -20,6 +20,8 @@ import {
   type BacktestResult,
   type BacktestRunSummary,
   type Kline,
+  type ParamField,
+  type StrategySchema,
   type Symbol,
 } from '../api/client'
 import KlineChart from '../components/KlineChart'
@@ -37,6 +39,8 @@ interface Props {
 
 export default function Backtest({ onNav }: Props) {
   const [symbols, setSymbols] = useState<Symbol[]>([])
+  const [schemas, setSchemas] = useState<StrategySchema[]>([])
+  const [kind, setKind] = useState('dual_ma')
   const [runs, setRuns] = useState<BacktestRunSummary[]>([])
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [klines, setKlines] = useState<Kline[]>([])
@@ -45,8 +49,35 @@ export default function Backtest({ onNav }: Props) {
 
   useEffect(() => {
     api.listSymbols().then(setSymbols).catch(() => {})
+    api.listStrategySchemas().then(setSchemas).catch(() => {})
     refreshRuns()
   }, [])
+
+  const schema = schemas.find((s) => s.kind === kind)
+
+  // 切换策略时把该策略的参数默认值写进表单
+  const onKindChange = (k: string) => {
+    setKind(k)
+    const sc = schemas.find((s) => s.kind === k)
+    if (sc) {
+      const defaults: Record<string, unknown> = {}
+      for (const f of sc.params) {
+        if (f.default !== undefined) defaults[f.name] = f.default
+      }
+      form.setFieldsValue(defaults)
+    }
+  }
+
+  // 按 schema 渲染参数输入（select / integer / number）
+  const renderParamInput = (f: ParamField) => {
+    if (f.type === 'select' && f.options) {
+      return <Select options={f.options.map((o) => ({ label: o, value: o }))} />
+    }
+    if (f.type === 'integer') {
+      return <InputNumber min={f.min} max={f.max} precision={0} style={{ width: '100%' }} />
+    }
+    return <InputNumber min={f.min} max={f.max} style={{ width: '100%' }} />
+  }
 
   const refreshRuns = () => {
     api.listRuns().then(setRuns).catch(() => {})
@@ -63,31 +94,30 @@ export default function Backtest({ onNav }: Props) {
     }
   }
 
-  const onRun = async (values: {
-    symbol: string
-    interval: string
-    strategy: string
-    fast: number
-    slow: number
-    initialCash: number
-    commission: number
-  }) => {
+  const onRun = async (values: Record<string, unknown>) => {
     setLoading(true)
     try {
+      // 按当前策略 schema 收集参数（原生类型，Go/Python 引擎两端都接受）
+      const params: Record<string, string | number | boolean> = {}
+      for (const f of schema?.params ?? []) {
+        const v = values[f.name]
+        if (v !== undefined && v !== null) params[f.name] = v as string | number | boolean
+      }
       const res = await api.runBacktest({
-        symbol: values.symbol,
-        strategy: values.strategy,
-        interval: values.interval,
-        params: { fast: String(values.fast), slow: String(values.slow) },
-        initialCash: values.initialCash,
-        commission: values.commission,
+        symbol: values.symbol as string,
+        strategy: values.strategy as string,
+        interval: values.interval as string,
+        params,
+        initialCash: values.initialCash as number,
+        commission: values.commission as number,
         limit: 500,
       })
       await showResult(res)
       refreshRuns()
       message.success('回测完成')
-    } catch (e) {
-      message.error('回测失败：' + String(e))
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { error?: string } } }
+      message.error('回测失败：' + (err?.response?.data?.error ?? String(e)))
     }
     setLoading(false)
   }
@@ -114,7 +144,7 @@ export default function Backtest({ onNav }: Props) {
                   interval: '1h',
                   strategy: 'dual_ma',
                   fast: 10,
-                  slow: 30,
+                  slow: 30, // dual_ma 默认；其余策略切换时由 schema 默认值填充
                   initialCash: 10000,
                   commission: 0.001,
                 }}
@@ -131,19 +161,26 @@ export default function Backtest({ onNav }: Props) {
                   <Segmented options={INTERVALS} />
                 </Form.Item>
                 <Form.Item name="strategy" label="策略">
-                  <Select options={[{ value: 'dual_ma', label: '双均线 (Dual MA)' }]} />
+                  <Select
+                    onChange={onKindChange}
+                    options={schemas.map((s) => ({
+                      value: s.kind,
+                      label: `${s.name} (${s.backtestEngine === 'go' ? 'Go' : 'Python'} 引擎)`,
+                    }))}
+                  />
                 </Form.Item>
                 <Row gutter={8}>
-                  <Col span={12}>
-                    <Form.Item name="fast" label="快线周期">
-                      <InputNumber min={2} max={200} style={{ width: '100%' }} />
-                    </Form.Item>
-                  </Col>
-                  <Col span={12}>
-                    <Form.Item name="slow" label="慢线周期">
-                      <InputNumber min={3} max={400} style={{ width: '100%' }} />
-                    </Form.Item>
-                  </Col>
+                  {(schema?.params ?? []).map((f) => (
+                    <Col span={12} key={f.name}>
+                      <Form.Item
+                        name={f.name}
+                        label={f.label}
+                        rules={f.required ? [{ required: true, message: `${f.label} 必填` }] : []}
+                      >
+                        {renderParamInput(f)}
+                      </Form.Item>
+                    </Col>
+                  ))}
                 </Row>
                 <Row gutter={8}>
                   <Col span={12}>
@@ -215,6 +252,11 @@ export default function Backtest({ onNav }: Props) {
                 <Text type="secondary">运行回测或点击历史记录查看结果</Text>
               ) : (
                 <>
+                  {m!.liquidated && (
+                    <Tag color="red" style={{ marginBottom: 12, fontSize: 14, padding: '4px 12px' }}>
+                      ⚠️ 回测期间触发强平——该参数组合在此行情下会爆仓
+                    </Tag>
+                  )}
                   <Row gutter={16} style={{ marginBottom: 16 }}>
                     <Col span={4}>
                       <Statistic
@@ -239,6 +281,17 @@ export default function Backtest({ onNav }: Props) {
                       <Statistic title="胜率" value={pct(m!.winRate)} />
                     </Col>
                   </Row>
+                  {m!.fundingCost !== undefined && m!.fundingCost !== 0 && (
+                    <Row gutter={16} style={{ marginBottom: 16 }}>
+                      <Col span={8}>
+                        <Statistic
+                          title="资金费净支出（正=付出，负=收入）"
+                          value={m!.fundingCost.toFixed(4)}
+                          valueStyle={{ color: m!.fundingCost > 0 ? '#cf1322' : '#3f8600' }}
+                        />
+                      </Col>
+                    </Row>
+                  )}
 
                   <Text type="secondary">净值曲线</Text>
                   <EquityChart equity={result.equityCurve} />

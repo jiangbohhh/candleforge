@@ -52,6 +52,8 @@ message BacktestMetrics {
   double sharpe = 4;          // 夏普比率
   int64 trade_count = 5;      // 成交次数
   double win_rate = 6;        // 胜率
+  double funding_cost = 7;    // 资金费净支出（正=付出，负=收入；仅永续，M6.5）
+  bool liquidated = 8;        // 回测期间是否触发强平（仅永续，M6.5）
 }
 
 // 净值曲线上的一个点。

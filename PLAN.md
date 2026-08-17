@@ -395,3 +395,83 @@ candleforge/
 - [ ] 本地 K8s：kind / minikube / k3d（择一，开发测试用）
 - [ ] Helm CLI
 - [ ] kubectl
+
+---
+
+## 16. 平台重构（进行中）
+
+> M0–M4 已全部交付（Binance 现货，单账户）。平台重构正在将系统升级为多策略/多标的量化平台。
+> **2026-08-17 范围修订**：删除 Gate.io 接入（多交易所降级为未来候选，见 §14.2）；插入 M6.5 永续合约网格。
+
+| 里程碑 | 状态 | 内容 |
+|--------|------|------|
+| ~~M5 Gate.io~~ | ❌ **已删除**（2026-08-17） | 多交易所降级为未来候选；跨所套利因此待定 |
+| **M6 策略引擎 + 现货网格** | ✅ **已完成** | 见下方 §16.1 |
+| **M6.5 永续合约网格** | ✅ **已完成**（2026-08-17，testnet 冒烟待做） | 见下方 §16.2 |
+| **M7 单用户认证** | ⏳ 待做 | 单用户密码 + JWT；凭证加密存储 |
+| **M8 做市策略** | ⏳ 待做 | 基于 M6 Strategy 框架扩展 MM（跨所套利待定：依赖第二家交易所） |
+| **M9 前端重构** | ⏳ 待做 | 全面迁移到 Tailwind + shadcn/ui |
+
+### 16.1 M6 完成内容（2026-08）
+
+**策略引擎最小框架**
+- [x] `internal/events/bus.go`：进程内订单事件总线（broker → 策略引擎，buffered chan pub/sub）
+- [x] `internal/strategy/registry.go`：策略注册表 `Descriptor{Kind,Name,Runnable,Backtest}`；`AllSchemas()` 供前端动态渲染参数表单
+- [x] `internal/strategy/manager.go`：常驻 runtime；`StartStrategy / StopStrategy / ResumeAll`；并行数量限制（`MAX_RUNNING_STRATEGIES`）；1 子账户 1 策略硬约束
+- [x] `internal/strategy/runner.go`：单策略 goroutine；串行事件队列；30s 对账 tick
+- [x] `Strategy` 接口：`Start / OnOrderUpdate / Reconcile / Stop(liquidate bool)`
+
+**现货网格策略**
+- [x] `internal/strategy/grid/params.go`：等差/等比参数解析+校验+网格线计算+参数 schema 导出
+- [x] `internal/strategy/grid/engine.go`：纯网格状态机（无 IO），`PlanInit / OnFill / Restore / Snapshot`
+- [x] `internal/strategy/grid/live.go`：实盘 adapter；intent-log 三步崩溃安全；risk 校验 + broker 下单
+- [x] `engine_test.go`：9 项单测，等差/等比/PlanInit/OnFill/Restore/Validate 全覆盖
+
+**Go-native 网格回测引擎**
+- [x] `internal/backtest/engine.go`：bar 内路径撮合（阳线 open→low→high→close，阴线反之）+ 开盘 gap 优先 + 级联成交
+- [x] `internal/backtest/metrics.go`：totalReturn/annualReturn/maxDrawdown/sharpe/tradeCount/winRate（对齐 Python runner.py）
+- [x] `internal/backtest/grid.go`：`RunGridBacktest` → `*pb.BacktestResponse`（走同一 protoMarshaler，前端零改动）
+- [x] `grid_test.go`：5 项回归测试
+- [x] `runBacktest` 双引擎路由：策略类型 → Go（grid）或 Python gRPC（CTA），出口代码一行不改
+
+**子账户体系**
+- [x] `0005_m6.sql`：sub 账户列、account_transfers 台账、strategy 补列、strategy_orders + 部分唯一索引
+- [x] `store/strategies.go`：StrategyRow CRUD、intent-log 三步（InsertIntent/AttachOrderID/MarkProcessed）、虚拟子账户创建/划转事务
+- [x] `BrokerFor` 解析器：按 accountID 路由到对应 broker 实例
+- [x] `POST /api/accounts/sub`：注册 Binance 真实子账户
+
+**API + 前端**
+- [x] `api/strategies.go`：策略 CRUD + 启停 + 资金划转 + schema + 子账户 API
+- [x] `frontend/src/pages/Strategies.tsx`：策略管理页（Antd，M9 前保持）；schema 驱动动态表单；WS 实时推送
+- [x] TopNav 增加"策略"标签页
+
+**遗留后续项**
+- [ ] ExchangeInfo 精度校验（tickSize/stepSize/minNotional）
+- [ ] Binance universalTransfer（live 子账户资金自动化划拨）
+- [ ] Binance testnet 子账户端到端冒烟
+- [ ] 真实子账户 BinanceBroker 动态实例化（目前 live 子账户走共享 SimBroker）
+
+### 16.2 M6.5 永续合约网格（当前里程碑，2026-08-17 立项）
+
+**已确认决策**
+1. 先做合约网格，杠杆（margin）网格推迟——合约三方向+杠杆覆盖其大部分场景
+2. 范围仅 **USDT-M 永续**，不做 COIN-M / 交割合约
+3. **long / short / neutral 三方向一次做齐**
+4. **杠杆固定 1x**（params 校验拒绝 >1，字段保留供后续解锁）；short/neutral 仍保留强平距离安全校验（1x 空头在开仓价上方约 +100% 处强平）
+5. 资金费率：**拉取历史 funding rate 数据**（`fapi/v1/fundingRate`），回测精确回放
+6. 持仓模式强制**单向（one-way mode）**，不做对冲模式
+
+**分阶段计划（全部完成，2026-08-17）**
+- [x] **A. 合约数据层**：symbol 后缀 `CRYPTO.BTC-USDT.PERP`；`BinanceFuturesSource`（fapi K线/mini-ticker）+ `market.Router` 按后缀路由；`0006_m65_perp.sql` funding_rates 表；启动增量 + 8h 周期同步（`SyncFundingRates`，空表回填 2 年）
+- [x] **B. 网格核心三方向**：direction 三值放行；签名仓位（空为负）；三方向 PlanInit（short 初始市价开空、neutral 零初始仓）；`baseSides` 基准方向结算（翻回基准=现金落袋才计回合）；`ShortLiqEstimate` 强平估算；**顺带修复 M6 遗留 bug：PlanInit 区间分类反了**（原实现给市价下方区间挂穿价 sell 单，靠首 bar 洗成交收敛；已改为标准形态：上方持仓挂 sell、下方挂 buy，全部休眠在市价远端）
+- [x] **C. 回测合约化**：1x 全额保证金下现金记账与现货同构；`ApplyFunding` 按历史费率逐期结算（proto 增 `funding_cost`/`liquidated` 字段，gen.sh 已重新生成两端）；`CheckLiquidation` bar 极值强平判定（mmr 0.5%，触发即终止回测并标记）；**顺带修复 M6 遗留 bug：/api/backtest 的 params 是 map[string]string，字符串值无法反序列化进 grid.Params**（改 map[string]any + 类型归一化，Python 路径转回字符串）
+- [x] **D. SimBroker 合约模式**：签名仓位 upsert（同向加权均价/减仓不变/穿零重置）；现货卖穿保护；风控层 PERP sell 放行（开空部分按名义额校验保证金）；`PlaceOrderRequest.ReduceOnly`
+- [x] **E. BinanceFuturesBroker**：fapi 下单/撤单（含 reduceOnly）、强制单向持仓模式、合约 listenKey UDS（手写 gorilla WS，避开 futures.UseTestnet 包级全局）、余额/签名仓位同步；env 守卫 `BINANCE_FUTURES_API_KEY/SECRET`（合约 testnet 独立密钥）
+- [x] **F. 前端**：Backtest 页改 schema 驱动动态参数表单（双引擎标注）；强平警示 + 资金费净支出展示；策略列表市场/方向列
+- [ ] Binance 合约 testnet 端到端冒烟（需用户申请 testnet.binancefuture.com 密钥后进行）
+
+**架构要点**
+- `PlaceOrderRequest` 增加 `ReduceOnly`（sim 忽略，futures 透传）
+- 网格核心状态机复用：区间两态翻转对合约同样成立，改动集中在 PlanInit（按方向铺初始仓位）与签名 inventory
+- 现货与永续是两套行情两套价格，K 线/回测按 symbol 后缀严格隔离，禁止混用
+- 1x 关键简化：合约现金记账 ≡ 允许负库存的现货记账（equity = cash + 签名仓位×价格），无需独立保证金台账

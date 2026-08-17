@@ -2,6 +2,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -73,6 +74,15 @@ func (h *Hub) Broadcast(msg []byte) {
 	default:
 		// 广播缓冲满，丢弃本条
 	}
+}
+
+// BroadcastEvent 包装 {type, data} 并调用 Broadcast，供各 broker 和策略引擎复用。
+func (h *Hub) BroadcastEvent(eventType string, data any) {
+	msg, err := json.Marshal(map[string]any{"type": eventType, "data": data})
+	if err != nil {
+		return
+	}
+	h.Broadcast(msg)
 }
 
 // HandleWS 是 gin 可用的 WebSocket 升级处理器。

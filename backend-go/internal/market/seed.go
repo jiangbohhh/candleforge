@@ -7,7 +7,7 @@ import (
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 )
 
-// PresetSymbols 是 M1 预置跟踪的主流币（USDT 现货对）。
+// PresetSymbols 是预置跟踪标的：USDT 现货对 + USDT-M 永续（.PERP 后缀）。
 var PresetSymbols = []store.Symbol{
 	{Symbol: "CRYPTO.BTC-USDT", Market: "CRYPTO", BaseAsset: "BTC", QuoteAsset: "USDT", NativeSymbol: "BTCUSDT", Name: "Bitcoin", Status: "TRADING"},
 	{Symbol: "CRYPTO.ETH-USDT", Market: "CRYPTO", BaseAsset: "ETH", QuoteAsset: "USDT", NativeSymbol: "ETHUSDT", Name: "Ethereum", Status: "TRADING"},
@@ -15,6 +15,8 @@ var PresetSymbols = []store.Symbol{
 	{Symbol: "CRYPTO.SOL-USDT", Market: "CRYPTO", BaseAsset: "SOL", QuoteAsset: "USDT", NativeSymbol: "SOLUSDT", Name: "Solana", Status: "TRADING"},
 	{Symbol: "CRYPTO.XRP-USDT", Market: "CRYPTO", BaseAsset: "XRP", QuoteAsset: "USDT", NativeSymbol: "XRPUSDT", Name: "XRP", Status: "TRADING"},
 	{Symbol: "CRYPTO.DOGE-USDT", Market: "CRYPTO", BaseAsset: "DOGE", QuoteAsset: "USDT", NativeSymbol: "DOGEUSDT", Name: "Dogecoin", Status: "TRADING"},
+	{Symbol: "CRYPTO.BTC-USDT.PERP", Market: "CRYPTO", BaseAsset: "BTC", QuoteAsset: "USDT", NativeSymbol: "BTCUSDT", Name: "Bitcoin Perp", Status: "TRADING"},
+	{Symbol: "CRYPTO.ETH-USDT.PERP", Market: "CRYPTO", BaseAsset: "ETH", QuoteAsset: "USDT", NativeSymbol: "ETHUSDT", Name: "Ethereum Perp", Status: "TRADING"},
 }
 
 // SupportedIntervals 是支持的 K 线周期。
@@ -82,4 +84,37 @@ func WatchedSymbols() []string {
 		out = append(out, s.Symbol)
 	}
 	return out
+}
+
+// fundingBackfillFrom 是空表首次回填资金费率的起点（约 2 年，~2200 期/标的，3 页请求）。
+const fundingBackfillDays = 730
+
+// SyncFundingRates 对全部永续预置标的做资金费率增量同步：
+// 空表从 fundingBackfillDays 前开始回填，否则从最新一期之后续拉。
+func SyncFundingRates(ctx context.Context, st *store.Store, perp *BinanceFuturesSource, now int64) error {
+	for _, sym := range PresetSymbols {
+		if !IsPerp(sym.Symbol) {
+			continue
+		}
+		last, err := st.LatestFundingTime(ctx, sym.Symbol)
+		if err != nil {
+			return err
+		}
+		start := last + 1
+		if last == 0 {
+			start = now - int64(fundingBackfillDays)*24*3600*1000
+		}
+		rs, err := perp.GetFundingRates(ctx, sym.Symbol, start)
+		if err != nil {
+			log.Printf("funding sync %s failed: %v", sym.Symbol, err)
+			continue
+		}
+		if err := st.UpsertFundingRates(ctx, rs); err != nil {
+			return err
+		}
+		if len(rs) > 0 {
+			log.Printf("funding synced %s: %d rates", sym.Symbol, len(rs))
+		}
+	}
+	return nil
 }

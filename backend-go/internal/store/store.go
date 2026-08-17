@@ -352,12 +352,13 @@ func (s *Store) SetAccountCash(ctx context.Context, accountID int64, cash float6
 // ── orders ──
 
 type InsertOrderParams struct {
-	AccountID int64
-	Symbol    string
-	Side      string
-	OrderType string
-	Price     float64
-	Quantity  float64
+	AccountID  int64
+	Symbol     string
+	Side       string
+	OrderType  string
+	Price      float64
+	Quantity   float64
+	StrategyID int64 // 0 = 手动下单，非零 = 策略自动单
 }
 
 type OrderRow struct {
@@ -371,6 +372,7 @@ type OrderRow struct {
 	FilledQty     float64   `json:"filledQty"`
 	Status        string    `json:"status"`
 	BrokerOrderID string    `json:"brokerOrderId,omitempty"`
+	StrategyID    int64     `json:"strategyId,omitempty"`
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
@@ -380,10 +382,14 @@ func (s *Store) InsertOrder(ctx context.Context, p InsertOrderParams) (orderID, 
 	if p.OrderType == "limit" {
 		price = p.Price
 	}
+	var strategyID interface{}
+	if p.StrategyID != 0 {
+		strategyID = p.StrategyID
+	}
 	err = s.db.QueryRowContext(ctx, `
-		INSERT INTO orders (account_id, symbol, side, type, price, quantity, status)
-		VALUES ($1,$2,$3,$4,$5,$6,'new')
-		RETURNING id, account_id`, p.AccountID, p.Symbol, p.Side, p.OrderType, price, p.Quantity).Scan(&orderID, &accountID)
+		INSERT INTO orders (account_id, symbol, side, type, price, quantity, status, strategy_id)
+		VALUES ($1,$2,$3,$4,$5,$6,'new',$7)
+		RETURNING id, account_id`, p.AccountID, p.Symbol, p.Side, p.OrderType, price, p.Quantity, strategyID).Scan(&orderID, &accountID)
 	return
 }
 
@@ -396,17 +402,19 @@ func (s *Store) GetOrder(ctx context.Context, id int64) (*OrderRow, error) {
 	var o OrderRow
 	var price, filledQty sql.NullFloat64
 	var brokerOID sql.NullString
+	var strategyID sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, broker_order_id, created_at
+		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, broker_order_id, strategy_id, created_at
 		 FROM orders WHERE id=$1`, id).Scan(
 		&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
-		&price, &o.Quantity, &filledQty, &o.Status, &brokerOID, &o.CreatedAt)
+		&price, &o.Quantity, &filledQty, &o.Status, &brokerOID, &strategyID, &o.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	o.Price = price.Float64
 	o.FilledQty = filledQty.Float64
 	o.BrokerOrderID = brokerOID.String
+	o.StrategyID = strategyID.Int64
 	return &o, nil
 }
 
@@ -415,7 +423,7 @@ func (s *Store) ListOrders(ctx context.Context, accountID int64, limit int) ([]O
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity, COALESCE(filled_qty,0), status, COALESCE(broker_order_id,''), created_at
+		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity, COALESCE(filled_qty,0), status, COALESCE(broker_order_id,''), COALESCE(strategy_id,0), created_at
 		FROM orders WHERE account_id=$1
 		ORDER BY id DESC LIMIT $2`, accountID, limit)
 	if err != nil {
@@ -426,7 +434,7 @@ func (s *Store) ListOrders(ctx context.Context, accountID int64, limit int) ([]O
 	for rows.Next() {
 		var o OrderRow
 		if err := rows.Scan(&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
-			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.BrokerOrderID, &o.CreatedAt); err != nil {
+			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.BrokerOrderID, &o.StrategyID, &o.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, o)

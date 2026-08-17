@@ -45,8 +45,30 @@ export interface BacktestMetrics {
   annualReturn: number
   maxDrawdown: number
   sharpe: number
-  tradeCount: number
+  tradeCount: number | string // protojson int64 → string
   winRate: number
+  fundingCost?: number // 永续：资金费净支出（正=付出，负=收入）
+  liquidated?: boolean // 永续：回测期间是否触发强平
+}
+
+// ── 策略 schema（/api/strategies/schemas，动态渲染参数表单）──
+export interface ParamField {
+  name: string
+  label: string
+  type: 'number' | 'integer' | 'select' | 'boolean'
+  default?: number | string | boolean
+  min?: number
+  max?: number
+  options?: string[]
+  required: boolean
+}
+
+export interface StrategySchema {
+  kind: string
+  name: string
+  runnable: boolean
+  backtestEngine: 'go' | 'python'
+  params: ParamField[]
 }
 
 export interface EquityPoint {
@@ -86,7 +108,7 @@ export interface RunBacktestBody {
   symbol: string
   strategy: string
   interval: string
-  params: Record<string, string>
+  params: Record<string, string | number | boolean>
   initialCash: number
   commission: number
   limit?: number
@@ -185,6 +207,8 @@ export const api = {
 
   runBacktest: (body: RunBacktestBody) =>
     http.post<BacktestResult>('/api/backtest', body).then((r) => r.data),
+  listStrategySchemas: () =>
+    http.get<StrategySchema[]>('/api/strategies/schemas').then((r) => r.data),
   listRuns: () =>
     http.get<BacktestRunSummary[]>('/api/backtest/runs').then((r) => r.data),
   getRun: (id: number) =>
@@ -217,10 +241,18 @@ export const api = {
 }
 
 // ── WebSocket（实时 ticker + 订单/成交事件）──
+export interface StrategyEvent {
+  id: number
+  status: 'running' | 'stopped' | 'error'
+  state: { inventory?: number; realizedPnl?: number; matchedCount?: number }
+  lastError: string
+}
+
 export interface WSHandlers {
   onTicker?: (t: Ticker) => void
   onOrder?: (o: Order) => void
   onTrade?: (t: Partial<Trade> & { orderId: number; symbol: string; side: OrderSide; price: number; quantity: number }) => void
+  onStrategy?: (s: StrategyEvent) => void
 }
 
 export function connectWS(handlers: WSHandlers): () => void {
@@ -242,6 +274,9 @@ export function connectWS(handlers: WSHandlers): () => void {
             break
           case 'trade':
             handlers.onTrade?.(msg.data as Parameters<NonNullable<WSHandlers['onTrade']>>[0])
+            break
+          case 'strategy':
+            handlers.onStrategy?.(msg.data as StrategyEvent)
             break
         }
       } catch {

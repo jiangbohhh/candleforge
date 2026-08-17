@@ -6,23 +6,33 @@ package broker
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/jiangbohhh/candleforge/backend-go/internal/events"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
 )
 
+func abs(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 // PlaceOrderRequest carries the fields needed to place an order.
 type PlaceOrderRequest struct {
-	AccountID int64
-	Symbol    string
-	Side      string
-	OrderType string
-	Price     float64 // limit price; ignored for market orders
-	Quantity  float64
+	AccountID  int64
+	Symbol     string
+	Side       string
+	OrderType  string
+	Price      float64 // limit price; ignored for market orders
+	Quantity   float64
+	StrategyID int64 // 0 = 手动下单，非零 = 策略自动单
+	ReduceOnly bool  // 仅永续有效：只减仓不反向开仓（sim 忽略，Binance futures 透传）
 }
 
 // Broker is the unified trading interface.
@@ -42,18 +52,21 @@ type SimBroker struct {
 	store   *store.Store
 	priceFn PriceFunc
 	hub     *ws.Hub
+	bus     *events.Bus
 	mu      sync.Mutex
 	stopCh  chan struct{}
 }
 
 // NewSimBroker creates a SimBroker and starts its limit-order matching loop.
 // hub may be nil for tests; when non-nil it receives order/trade event broadcasts.
-func NewSimBroker(db *sql.DB, st *store.Store, priceFn PriceFunc, hub *ws.Hub) *SimBroker {
+// bus may be nil; when non-nil filled orders are published to the strategy engine.
+func NewSimBroker(db *sql.DB, st *store.Store, priceFn PriceFunc, hub *ws.Hub, bus *events.Bus) *SimBroker {
 	sb := &SimBroker{
 		db:      db,
 		store:   st,
 		priceFn: priceFn,
 		hub:     hub,
+		bus:     bus,
 		stopCh:  make(chan struct{}),
 	}
 	go sb.matchLoop()
@@ -140,26 +153,45 @@ func (b *SimBroker) executeFill(o store.PendingOrder, fillPrice float64) error {
 		return err
 	}
 
-	// Upsert position
-	if o.Side == "buy" {
-		_, err = tx.Exec(`
-			INSERT INTO positions (account_id, symbol, quantity, avg_price)
-			VALUES ($1,$2,$3,$4)
-			ON CONFLICT (account_id, symbol) DO UPDATE SET
-				quantity = positions.quantity + EXCLUDED.quantity,
-				avg_price = CASE
-					WHEN positions.quantity + EXCLUDED.quantity = 0 THEN 0
-					ELSE (positions.avg_price * positions.quantity + EXCLUDED.avg_price * EXCLUDED.quantity) / (positions.quantity + EXCLUDED.quantity)
-				END,
-				updated_at = now()`,
-			o.AccountID, o.Symbol, o.Quantity, fillPrice)
-	} else {
-		_, err = tx.Exec(`
-			UPDATE positions SET quantity = quantity - $1, updated_at = now()
-			WHERE account_id=$2 AND symbol=$3`,
-			o.Quantity, o.AccountID, o.Symbol)
+	// Upsert position（签名仓位：永续可为负=空头；现货禁止卖穿为负）
+	var posQty, posAvg float64
+	err = tx.QueryRow(`SELECT quantity, avg_price FROM positions WHERE account_id=$1 AND symbol=$2 FOR UPDATE`,
+		o.AccountID, o.Symbol).Scan(&posQty, &posAvg)
+	if err != nil && err != sql.ErrNoRows {
+		return err
 	}
-	if err != nil {
+
+	delta := o.Quantity
+	if o.Side == "sell" {
+		delta = -o.Quantity
+	}
+	newQty := posQty + delta
+
+	if !market.IsPerp(o.Symbol) && newQty < -1e-12 {
+		// 现货卖穿：跳过成交（挂单保留；风控层正常时到不了这里）
+		log.Printf("sim broker: spot oversell blocked for order %d (%s)", o.ID, o.Symbol)
+		return nil
+	}
+
+	// 均价规则：同向加仓=加权均价；减仓=均价不变；穿越零点=以本次成交价重置
+	var newAvg float64
+	switch {
+	case newQty == 0:
+		newAvg = 0
+	case posQty == 0 || (posQty > 0) == (delta > 0): // 开仓或同向加仓
+		newAvg = (posAvg*abs(posQty) + fillPrice*abs(delta)) / (abs(posQty) + abs(delta))
+	case (posQty > 0) != (newQty > 0): // 穿越零点反向
+		newAvg = fillPrice
+	default: // 减仓
+		newAvg = posAvg
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO positions (account_id, symbol, quantity, avg_price)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (account_id, symbol) DO UPDATE SET
+			quantity = EXCLUDED.quantity, avg_price = EXCLUDED.avg_price, updated_at = now()`,
+		o.AccountID, o.Symbol, newQty, newAvg); err != nil {
 		return err
 	}
 
@@ -177,14 +209,16 @@ func (b *SimBroker) executeFill(o store.PendingOrder, fillPrice float64) error {
 
 	// Post-commit: broadcast order + trade events
 	b.broadcastOrder(o.ID)
-	b.broadcastEvent("trade", map[string]any{
-		"orderId":  o.ID,
-		"symbol":   o.Symbol,
-		"side":     o.Side,
-		"price":    fillPrice,
-		"quantity": o.Quantity,
-		"tradedAt": time.Now().UTC(),
-	})
+	if b.hub != nil {
+		b.hub.BroadcastEvent("trade", map[string]any{
+			"orderId":  o.ID,
+			"symbol":   o.Symbol,
+			"side":     o.Side,
+			"price":    fillPrice,
+			"quantity": o.Quantity,
+			"tradedAt": time.Now().UTC(),
+		})
+	}
 	return nil
 }
 
@@ -194,12 +228,13 @@ func (b *SimBroker) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*sto
 	defer b.mu.Unlock()
 
 	orderID, accountID, err := b.store.InsertOrder(ctx, store.InsertOrderParams{
-		AccountID: req.AccountID,
-		Symbol:    req.Symbol,
-		Side:      req.Side,
-		OrderType: req.OrderType,
-		Price:     req.Price,
-		Quantity:  req.Quantity,
+		AccountID:  req.AccountID,
+		Symbol:     req.Symbol,
+		Side:       req.Side,
+		OrderType:  req.OrderType,
+		Price:      req.Price,
+		Quantity:   req.Quantity,
+		StrategyID: req.StrategyID,
 	})
 	if err != nil {
 		return nil, err
@@ -266,26 +301,17 @@ func (b *SimBroker) GetPositions(ctx context.Context, accountID int64) ([]store.
 	return b.store.ListPositions(ctx, accountID)
 }
 
-// broadcastOrder fetches the order's latest state and pushes it on the WS hub.
+// broadcastOrder fetches the order's latest state, pushes it on the WS hub,
+// and publishes to the events bus (for strategy engine routing).
 func (b *SimBroker) broadcastOrder(orderID int64) {
-	if b.hub == nil {
-		return
-	}
 	o, err := b.store.GetOrder(context.Background(), orderID)
 	if err != nil {
 		return
 	}
-	b.broadcastEvent("order", o)
-}
-
-// broadcastEvent encodes {type, data} and sends to the hub (non-blocking).
-func (b *SimBroker) broadcastEvent(eventType string, data any) {
-	if b.hub == nil {
-		return
+	if b.hub != nil {
+		b.hub.BroadcastEvent("order", o)
 	}
-	msg, err := json.Marshal(map[string]any{"type": eventType, "data": data})
-	if err != nil {
-		return
+	if b.bus != nil {
+		b.bus.PublishOrder(o)
 	}
-	b.hub.Broadcast(msg)
 }

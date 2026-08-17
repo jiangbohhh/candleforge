@@ -4,13 +4,13 @@ package broker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
 
 	binance "github.com/adshao/go-binance/v2"
 
+	"github.com/jiangbohhh/candleforge/backend-go/internal/events"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
@@ -64,6 +64,7 @@ type BinanceBroker struct {
 	client    *binance.Client
 	store     *store.Store
 	hub       *ws.Hub
+	bus       *events.Bus
 	accountID int64
 	opts      BinanceOptions
 	uds       *userDataStream
@@ -71,10 +72,10 @@ type BinanceBroker struct {
 
 // NewBinanceBroker 构造 broker，同步初始余额，启动 User Data Stream。
 // ctx 仅用于初始余额同步；失败即报错，避免上线后悄悄空跑。
-func NewBinanceBroker(ctx context.Context, st *store.Store, hub *ws.Hub, accountID int64, opts BinanceOptions) (*BinanceBroker, error) {
+func NewBinanceBroker(ctx context.Context, st *store.Store, hub *ws.Hub, bus *events.Bus, accountID int64, opts BinanceOptions) (*BinanceBroker, error) {
 	c := binance.NewClient(opts.APIKey, opts.APISecret)
 	c.BaseURL = opts.restBase()
-	b := &BinanceBroker{client: c, store: st, hub: hub, accountID: accountID, opts: opts}
+	b := &BinanceBroker{client: c, store: st, hub: hub, bus: bus, accountID: accountID, opts: opts}
 
 	if err := b.SyncBalances(ctx); err != nil {
 		return nil, fmt.Errorf("initial balance sync: %w", err)
@@ -128,12 +129,13 @@ func (b *BinanceBroker) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 	}
 
 	localID, _, err := b.store.InsertOrder(ctx, store.InsertOrderParams{
-		AccountID: req.AccountID,
-		Symbol:    req.Symbol,
-		Side:      req.Side,
-		OrderType: req.OrderType,
-		Price:     req.Price,
-		Quantity:  req.Quantity,
+		AccountID:  req.AccountID,
+		Symbol:     req.Symbol,
+		Side:       req.Side,
+		OrderType:  req.OrderType,
+		Price:      req.Price,
+		Quantity:   req.Quantity,
+		StrategyID: req.StrategyID,
 	})
 	if err != nil {
 		return nil, err
@@ -214,26 +216,17 @@ func (b *BinanceBroker) GetPositions(ctx context.Context, accountID int64) ([]st
 // ── 内部 helper ──
 
 func (b *BinanceBroker) broadcastOrder(localID int64) {
-	if b.hub == nil {
-		return
-	}
 	o, err := b.store.GetOrder(context.Background(), localID)
 	if err != nil {
 		log.Printf("binance: broadcastOrder load %d: %v", localID, err)
 		return
 	}
-	b.broadcastEvent("order", o)
-}
-
-func (b *BinanceBroker) broadcastEvent(t string, data any) {
-	if b.hub == nil {
-		return
+	if b.hub != nil {
+		b.hub.BroadcastEvent("order", o)
 	}
-	msg, err := json.Marshal(map[string]any{"type": t, "data": data})
-	if err != nil {
-		return
+	if b.bus != nil {
+		b.bus.PublishOrder(o)
 	}
-	b.hub.Broadcast(msg)
 }
 
 func mapBinanceStatus(s binance.OrderStatusType) string {

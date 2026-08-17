@@ -2,7 +2,7 @@ import { Segmented, Typography } from 'antd'
 
 const { Title, Text } = Typography
 
-export type Tab = 'market' | 'backtest' | 'trading'
+export type Tab = 'market' | 'backtest' | 'trading' | 'strategies'
 
 interface Props {
   active: Tab
@@ -24,6 +24,7 @@ export default function TopNav({ active, onNav }: Props) {
           { label: '行情', value: 'market' },
           { label: '回测', value: 'backtest' },
           { label: '交易', value: 'trading' },
+          { label: '策略', value: 'strategies' },
         ]}
       />
       <Text style={{ color: '#8c8c8c', marginLeft: 'auto' }}>

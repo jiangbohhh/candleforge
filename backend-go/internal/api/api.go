@@ -18,6 +18,7 @@ import (
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/strategy"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
 	"github.com/jiangbohhh/candleforge/backend-go/pb"
 )
@@ -30,9 +31,10 @@ type Server struct {
 	src     market.MarketDataSource
 	live    *market.LiveFeed
 	hub     *ws.Hub
-	brokers map[string]broker.Broker // account.broker → Broker 实例
+	brokers map[string]broker.Broker // account.broker → Broker 实例（主账户）
 	risk    *risk.Engine
-	envInfo map[string]string // 给 /api/brokers 用，如 {"binance":"testnet"}
+	envInfo map[string]string
+	mgr     *strategy.Manager // M6 策略引擎（可为 nil，向后兼容）
 }
 
 // New 构造 API server。brokers 至少包含 "sim"。如果 BinanceBroker 启用则加 "binance"。
@@ -43,6 +45,11 @@ func New(db *sql.DB, st *store.Store, quant *grpcclient.QuantClient,
 		db: db, store: st, quant: quant, src: src, live: live, hub: hub,
 		brokers: brokers, risk: riskEngine, envInfo: envInfo,
 	}
+}
+
+// SetManager 注入 M6 策略引擎（在 main.go 组装完成后调用）。
+func (s *Server) SetManager(mgr *strategy.Manager) {
+	s.mgr = mgr
 }
 
 // Router 构建并返回 Gin 路由。
@@ -84,6 +91,20 @@ func (s *Server) Router() *gin.Engine {
 	// 风控
 	r.GET("/api/risk/status", s.getRiskStatus)
 	r.POST("/api/risk/halt", s.setRiskHalt)
+
+	// M6 策略引擎
+	r.GET("/api/strategies/schemas", s.listStrategySchemas)    // 须在 /:id 之前
+	r.GET("/api/strategies", s.listStrategies)
+	r.POST("/api/strategies", s.createStrategy)
+	r.GET("/api/strategies/:id", s.getStrategy)
+	r.DELETE("/api/strategies/:id", s.deleteStrategy)
+	r.POST("/api/strategies/:id/start", s.startStrategy)
+	r.POST("/api/strategies/:id/stop", s.stopStrategy)
+	r.POST("/api/strategies/:id/transfer", s.transferStrategyFunds)
+
+	// 子账户注册（live）
+	r.POST("/api/accounts/sub", s.registerSubAccount)
+	r.GET("/api/accounts/sub", s.listSubAccounts)
 
 	// 前端实时 WS
 	r.GET("/ws", func(c *gin.Context) {
@@ -208,13 +229,13 @@ var protoMarshaler = protojson.MarshalOptions{EmitUnpopulated: true, UseProtoNam
 
 func (s *Server) runBacktest(c *gin.Context) {
 	var body struct {
-		Symbol      string            `json:"symbol"`
-		Strategy    string            `json:"strategy"`
-		Interval    string            `json:"interval"`
-		Params      map[string]string `json:"params"`
-		InitialCash float64           `json:"initialCash"`
-		Commission  float64           `json:"commission"`
-		Limit       int               `json:"limit"`
+		Symbol      string         `json:"symbol"`
+		Strategy    string         `json:"strategy"`
+		Interval    string         `json:"interval"`
+		Params      map[string]any `json:"params"` // 值可为字符串（旧表单）或原生类型
+		InitialCash float64        `json:"initialCash"`
+		Commission  float64        `json:"commission"`
+		Limit       int            `json:"limit"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -245,21 +266,41 @@ func (s *Server) runBacktest(c *gin.Context) {
 		return
 	}
 
-	pbKlines := make([]*pb.Kline, len(klines))
-	for i, k := range klines {
-		pbKlines[i] = &pb.Kline{
-			OpenTime: k.OpenTime, Open: k.Open, High: k.High,
-			Low: k.Low, Close: k.Close, Volume: k.Volume,
+	// 双引擎路由：注册表中有 Go 回测函数 → 用 Go 引擎；否则走 Python gRPC。
+	var resp *pb.BacktestResponse
+	paramsJSON := normalizeParams(body.Params)
+	if d := strategy.Lookup(body.Strategy); d != nil && d.Backtest != nil {
+		// 永续标的取回测窗口内的资金费率历史（现货为空）
+		var funding []store.FundingRate
+		if market.IsPerp(body.Symbol) {
+			last := klines[len(klines)-1]
+			funding, err = s.store.ListFundingRates(ctx, body.Symbol, klines[0].OpenTime, last.CloseTime)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
 		}
-	}
-
-	resp, err := s.quant.RunBacktest(ctx, &pb.BacktestRequest{
-		Symbol: body.Symbol, Strategy: body.Strategy, Params: body.Params,
-		InitialCash: body.InitialCash, Commission: body.Commission, Klines: pbKlines,
-	})
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "backtest failed: " + err.Error()})
-		return
+		resp, err = d.Backtest(klines, funding, paramsJSON, body.InitialCash, body.Commission)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "backtest failed: " + err.Error()})
+			return
+		}
+	} else {
+		pbKlines := make([]*pb.Kline, len(klines))
+		for i, k := range klines {
+			pbKlines[i] = &pb.Kline{
+				OpenTime: k.OpenTime, Open: k.Open, High: k.High,
+				Low: k.Low, Close: k.Close, Volume: k.Volume,
+			}
+		}
+		resp, err = s.quant.RunBacktest(ctx, &pb.BacktestRequest{
+			Symbol: body.Symbol, Strategy: body.Strategy, Params: stringifyParams(body.Params),
+			InitialCash: body.InitialCash, Commission: body.Commission, Klines: pbKlines,
+		})
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "backtest failed: " + err.Error()})
+			return
+		}
 	}
 
 	// protojson 序列化各部分用于落库与返回
@@ -272,7 +313,6 @@ func (s *Server) runBacktest(c *gin.Context) {
 		b, _ := protoMarshaler.Marshal(resp.GetTrades()[i])
 		return json.RawMessage(b)
 	})
-	paramsJSON, _ := json.Marshal(body.Params)
 
 	id, err := s.store.InsertBacktestRun(ctx, store.BacktestRun{
 		Symbol: body.Symbol, Strategy: body.Strategy, Interval: body.Interval,
@@ -294,6 +334,35 @@ func (s *Server) runBacktest(c *gin.Context) {
 		"equityCurve": json.RawMessage(equityJSON),
 		"trades":      json.RawMessage(tradesJSON),
 	})
+}
+
+// normalizeParams 把参数值归一化为原生 JSON 类型（旧表单发字符串数字，Go 引擎需要 float/bool）。
+func normalizeParams(in map[string]any) json.RawMessage {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if s, ok := v.(string); ok {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				out[k] = f
+				continue
+			}
+			if b, err := strconv.ParseBool(s); err == nil {
+				out[k] = b
+				continue
+			}
+		}
+		out[k] = v
+	}
+	b, _ := json.Marshal(out)
+	return b
+}
+
+// stringifyParams 把参数值转为字符串（Python gRPC 契约是 map<string,string>）。
+func stringifyParams(in map[string]any) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = fmt.Sprint(v)
+	}
+	return out
 }
 
 func (s *Server) listBacktestRuns(c *gin.Context) {
