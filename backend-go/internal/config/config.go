@@ -29,6 +29,11 @@ type Config struct {
 
 	// M6 策略引擎
 	MaxRunningStrategies int // 并行策略上限；默认 5
+
+	// 安全（WP2）
+	AuthToken        string   // 静态 API Token；空 → 鉴权关闭（仅本地开发）
+	CORSOrigins      []string // CORS 白名单；空 → 反射任意来源（仅本地开发）
+	CredentialEncKey string   // 子账户凭证加密主密钥（64-hex 或 base64 的 32 字节）；空 → 明文落库（仅本地开发）
 }
 
 // Load 从环境变量读取配置，缺省时回落到适合本地开发的默认值。
@@ -48,7 +53,26 @@ func Load() *Config {
 		BinanceFuturesAPISecret: os.Getenv("BINANCE_FUTURES_API_SECRET"),
 
 		MaxRunningStrategies: getint("MAX_RUNNING_STRATEGIES", 5),
+
+		AuthToken:        os.Getenv("AUTH_TOKEN"),
+		CORSOrigins:      getlist("CORS_ORIGINS"),
+		CredentialEncKey: os.Getenv("CREDENTIAL_ENC_KEY"),
 	}
+}
+
+// getlist 读取逗号分隔的环境变量为字符串切片（去空白，忽略空项）。
+func getlist(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // LiveBrokerEnabled 报告是否能构造 BinanceBroker（仅看 key/secret）。

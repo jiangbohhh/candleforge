@@ -33,6 +33,11 @@ type Manager struct {
 
 	mu      sync.RWMutex
 	runners map[int64]*runner
+
+	// startMu 串行化 start/stop 的「校验 + 占用检查 + 认领」临界区，
+	// 关闭 check-then-start 竞态（同策略双跑 / 两策略抢同一子账户）。
+	// 慢操作（下单）在锁外执行，权威并发闸门是 DB 的条件状态迁移。
+	startMu sync.Mutex
 }
 
 // NewManager 构建 Manager；不启动任何策略。
@@ -90,7 +95,8 @@ func (m *Manager) resumeOne(ctx context.Context, row store.StrategyRow) error {
 		return err
 	}
 	r := newRunner(row.ID, row.Kind, impl, m.env.Store, m.emitStrategyRaw)
-	if err := r.impl.Reconcile(ctx); err != nil {
+	r.onExit = m.runnerExitHandler(row.ID)
+	if err := r.safeReconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
 	// 恢复后直接把事件循环跑起来（不再调 Start，因为策略已在 running 状态）
@@ -105,79 +111,129 @@ func (m *Manager) resumeOne(ctx context.Context, row store.StrategyRow) error {
 	return nil
 }
 
+// runnerExitHandler 返回一个 onExit 回调：当某策略的事件循环因 panic 异常退出时，
+// 把它从 runners map 摘除，使其可被重新启动（状态已在 loop 内置为 error）。
+func (m *Manager) runnerExitHandler(id int64) func(error) {
+	return func(err error) {
+		m.mu.Lock()
+		delete(m.runners, id)
+		m.mu.Unlock()
+		log.Printf("strategy %d runner removed after abnormal exit: %v", id, err)
+	}
+}
+
 // StartStrategy 启动一个已创建的策略实例。
+//
+// 并发安全：校验 + 占用检查 + 认领在 startMu 下串行完成，认领用条件 SQL
+// （TryMarkStrategyRunning）作为权威闸门；随后释放锁再执行慢操作（impl.Start 下单）。
+// 这样既拦住同策略双启动，也拦住两个策略抢同一子账户，且不在下单期间长时间持锁。
 func (m *Manager) StartStrategy(ctx context.Context, strategyID int64) error {
+	r, err := m.claimAndBuild(ctx, strategyID)
+	if err != nil {
+		return err
+	}
+
+	// 慢操作在锁外：impl.Start 会向交易所下初始单/网格单。
+	// 认领已在 DB 落地（status=running），并发启动此时已被拦截。
+	if err := r.start(ctx); err != nil {
+		// 回滚认领：置 error，让策略可被重新启动。
+		_ = m.env.Store.UpdateStrategyStatus(ctx, strategyID, "error", err.Error())
+		m.emitStrategy(strategyID, "error", err.Error())
+		return fmt.Errorf("start: %w", err)
+	}
+
+	m.mu.Lock()
+	m.runners[strategyID] = r
+	m.mu.Unlock()
+
+	m.emitStrategy(strategyID, "running", "")
+	return nil
+}
+
+// claimAndBuild 在 startMu 下完成校验、占用检查、状态认领与 impl 构建。
+// 成功返回未启动的 runner；调用方在锁外调用 r.start 完成下单。
+func (m *Manager) claimAndBuild(ctx context.Context, strategyID int64) (*runner, error) {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	if m.IsRunning(strategyID) {
+		return nil, fmt.Errorf("strategy already running")
+	}
+
 	row, err := m.env.Store.GetStrategy(ctx, strategyID)
 	if err != nil {
-		return fmt.Errorf("get strategy: %w", err)
+		return nil, fmt.Errorf("get strategy: %w", err)
 	}
 	if row.Status == "running" {
-		return fmt.Errorf("strategy already running")
+		return nil, fmt.Errorf("strategy already running")
 	}
 
 	// 并行数量检查
 	n, err := m.env.Store.CountRunningStrategies(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if n >= m.maxRun {
-		return fmt.Errorf("max running strategies (%d) reached", m.maxRun)
+		return nil, fmt.Errorf("max running strategies (%d) reached", m.maxRun)
 	}
 
 	// 子账户占用检查
 	if row.AccountID != 0 {
 		if err := m.checkAccountFree(ctx, row.AccountID, strategyID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	d := Lookup(row.Kind)
 	if d == nil || !d.Runnable {
-		return fmt.Errorf("strategy kind %q is not runnable", row.Kind)
+		return nil, fmt.Errorf("strategy kind %q is not runnable", row.Kind)
 	}
 
 	impl, err := m.buildImpl(ctx, *row)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	// 权威认领：条件迁移到 running。并发调用中只有一个能拿到 true。
+	claimed, err := m.env.Store.TryMarkStrategyRunning(ctx, strategyID)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, fmt.Errorf("strategy already running")
 	}
 
 	r := newRunner(row.ID, row.Kind, impl, m.env.Store, m.emitStrategyRaw)
-	if err := r.start(ctx); err != nil {
-		return fmt.Errorf("start: %w", err)
-	}
-
-	m.mu.Lock()
-	m.runners[row.ID] = r
-	m.mu.Unlock()
-
-	if err := m.env.Store.UpdateStrategyStatus(ctx, strategyID, "running", ""); err != nil {
-		return err
-	}
-	m.emitStrategy(strategyID, "running", "")
-	return nil
+	r.onExit = m.runnerExitHandler(row.ID)
+	return r, nil
 }
 
 // StopStrategy 停止一个运行中的策略实例；liquidate=true 则清仓。
 func (m *Manager) StopStrategy(ctx context.Context, strategyID int64, liquidate bool) error {
+	// 在 startMu 下摘除 runner 并把状态落为 stopped，使并发的 StartStrategy
+	// 要么在本次停止前完整跑完，要么看到 stopped/无 runner，不会与停止交错。
+	m.startMu.Lock()
 	m.mu.Lock()
 	r, ok := m.runners[strategyID]
 	if ok {
 		delete(m.runners, strategyID)
 	}
 	m.mu.Unlock()
+	err := m.env.Store.UpdateStrategyStatus(ctx, strategyID, "stopped", "")
+	m.startMu.Unlock()
+	if err != nil {
+		return err
+	}
 
 	if ok {
-		// 先通知 impl 执行停止流程（撤单 + 可选清仓）
-		if err := r.impl.Stop(ctx, liquidate); err != nil {
+		// 先通知 impl 执行停止流程（撤单 + 可选清仓），panic 不得崩进程。
+		if err := r.safeStop(ctx, liquidate); err != nil {
 			log.Printf("strategy %d stop impl: %v", strategyID, err)
 		}
 		// 关闭事件循环
 		r.stop()
 	}
 
-	if err := m.env.Store.UpdateStrategyStatus(ctx, strategyID, "stopped", ""); err != nil {
-		return err
-	}
 	m.emitStrategy(strategyID, "stopped", "")
 	return nil
 }

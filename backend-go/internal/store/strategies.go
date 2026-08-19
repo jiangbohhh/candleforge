@@ -129,6 +129,22 @@ func (s *Store) UpdateStrategyStatus(ctx context.Context, id int64, status, last
 	return err
 }
 
+// TryMarkStrategyRunning 原子地把策略从非 running 迁移到 running，作为启动的权威闸门。
+// 返回 true 表示本次调用赢得了迁移；false 表示该策略已处于 running（并发/重复启动被拦截）。
+func (s *Store) TryMarkStrategyRunning(ctx context.Context, id int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE strategies SET status='running', last_error='', updated_at=now() WHERE id=$1 AND status<>'running'`,
+		id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 func (s *Store) UpdateStrategyState(ctx context.Context, id int64, state json.RawMessage) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE strategies SET state=$1, updated_at=now() WHERE id=$2`, state, id)
@@ -200,14 +216,23 @@ func (s *Store) CreateVirtualSubAccount(ctx context.Context, parentID int64, nam
 }
 
 // RegisterRealSubAccount 登记一个已存在的 Binance 真实子账户。
+// api_key/api_secret 在落库前经应用层加密（若已配置主密钥）。
 func (s *Store) RegisterRealSubAccount(ctx context.Context, parentID int64, name, subEmail, apiKey, apiSecret string) (*SubAccount, error) {
+	encKey, err := s.sec.Encrypt(apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt api_key: %w", err)
+	}
+	encSecret, err := s.sec.Encrypt(apiSecret)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt api_secret: %w", err)
+	}
 	var id int64
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO accounts (name, kind, broker, cash, parent_id, sub_email, api_key, api_secret)
 		VALUES ($1,'sub','binance',0,$2,$3,$4,$5)
 		ON CONFLICT (name) DO NOTHING
 		RETURNING id`,
-		name, parentID, subEmail, apiKey, apiSecret).Scan(&id)
+		name, parentID, subEmail, encKey, encSecret).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +252,24 @@ func (s *Store) GetSubAccount(ctx context.Context, id int64) (*SubAccount, error
 		return nil, err
 	}
 	sa.ParentID = parentID.Int64
+	if err := s.decryptCreds(&sa); err != nil {
+		return nil, err
+	}
 	return &sa, nil
+}
+
+// decryptCreds 就地解密子账户的 api_key/api_secret（历史明文原样返回）。
+func (s *Store) decryptCreds(sa *SubAccount) error {
+	k, err := s.sec.Decrypt(sa.APIKey)
+	if err != nil {
+		return fmt.Errorf("decrypt api_key (account %d): %w", sa.ID, err)
+	}
+	sec, err := s.sec.Decrypt(sa.APISecret)
+	if err != nil {
+		return fmt.Errorf("decrypt api_secret (account %d): %w", sa.ID, err)
+	}
+	sa.APIKey, sa.APISecret = k, sec
+	return nil
 }
 
 func (s *Store) ListSubAccounts(ctx context.Context, parentID int64) ([]SubAccount, error) {
@@ -248,6 +290,9 @@ func (s *Store) ListSubAccounts(ctx context.Context, parentID int64) ([]SubAccou
 			return nil, err
 		}
 		sa.ParentID = parentID.Int64
+		if err := s.decryptCreds(&sa); err != nil {
+			return nil, err
+		}
 		out = append(out, sa)
 	}
 	return out, rows.Err()

@@ -3,11 +3,13 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +37,10 @@ type Server struct {
 	risk    *risk.Engine
 	envInfo map[string]string
 	mgr     *strategy.Manager // M6 策略引擎（可为 nil，向后兼容）
+
+	// 安全（WP2）
+	authToken   string   // 静态 API Token；空 → 鉴权关闭
+	corsOrigins []string // CORS 白名单；空 → 反射任意来源
 }
 
 // New 构造 API server。brokers 至少包含 "sim"。如果 BinanceBroker 启用则加 "binance"。
@@ -52,10 +58,18 @@ func (s *Server) SetManager(mgr *strategy.Manager) {
 	s.mgr = mgr
 }
 
+// SetSecurity 注入鉴权 token 与 CORS 白名单（在 main.go 组装完成后调用）。
+// authToken 为空则鉴权关闭；corsOrigins 为空则反射任意来源（均仅供本地开发）。
+func (s *Server) SetSecurity(authToken string, corsOrigins []string) {
+	s.authToken = authToken
+	s.corsOrigins = corsOrigins
+}
+
 // Router 构建并返回 Gin 路由。
 func (s *Server) Router() *gin.Engine {
 	r := gin.Default()
-	r.Use(cors())
+	r.Use(cors(s.corsOrigins))
+	r.Use(auth(s.authToken))
 
 	r.GET("/healthz", s.healthz)
 	r.GET("/api/ping-quant", s.pingQuant)
@@ -114,18 +128,69 @@ func (s *Server) Router() *gin.Engine {
 	return r
 }
 
-// cors 是开发期用的宽松 CORS 中间件。
-func cors() gin.HandlerFunc {
+// cors 返回 CORS 中间件。origins 为空时反射任意来源（仅本地开发）；
+// 非空时只对白名单内的 Origin 放行，并回显具体来源（Token 鉴权下不能用 "*"）。
+func cors(origins []string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		allowed[o] = struct{}{}
+	}
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.Request.Header.Get("Origin")
+		switch {
+		case len(origins) == 0:
+			// 开发模式：反射来源（若无 Origin 则用 *），并允许携带凭证。
+			if origin != "" {
+				c.Header("Access-Control-Allow-Origin", origin)
+			} else {
+				c.Header("Access-Control-Allow-Origin", "*")
+			}
+		case origin != "":
+			if _, ok := allowed[origin]; ok {
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			}
+			// 不在白名单：不设 Allow-Origin，浏览器据此拦截。
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization")
+		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, X-Auth-Token")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 		c.Next()
 	}
+}
+
+// auth 返回静态 Token 鉴权中间件。token 为空则放行（开发模式）。
+// 已配置时校验 Authorization: Bearer <token> / X-Auth-Token 头 / ?token= 查询参数
+// （查询参数用于浏览器 WebSocket，无法自定义握手头）。/healthz 与预检始终放行。
+func auth(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if token == "" || c.Request.Method == http.MethodOptions || c.Request.URL.Path == "/healthz" {
+			c.Next()
+			return
+		}
+		got := extractToken(c)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.Next()
+	}
+}
+
+func extractToken(c *gin.Context) string {
+	if h := c.GetHeader("Authorization"); h != "" {
+		if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+			return h[7:]
+		}
+		return h
+	}
+	if h := c.GetHeader("X-Auth-Token"); h != "" {
+		return h
+	}
+	return c.Query("token")
 }
 
 // ── 健康检查 ──

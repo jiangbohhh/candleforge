@@ -6,15 +6,23 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/jiangbohhh/candleforge/backend-go/internal/credcrypto"
 )
 
 // Store 持有数据库连接。
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	sec *credcrypto.Cipher // 子账户凭证加解密；nil → 明文（仅本地开发）
 }
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
+}
+
+// SetCipher 注入凭证加密器（在 main.go 组装时调用）。nil 表示明文落库。
+func (s *Store) SetCipher(c *credcrypto.Cipher) {
+	s.sec = c
 }
 
 // ── 领域类型 ──

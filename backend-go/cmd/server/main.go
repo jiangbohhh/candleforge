@@ -17,6 +17,7 @@ import (
 	"github.com/jiangbohhh/candleforge/backend-go/internal/grpcclient"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/market"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
+	"github.com/jiangbohhh/candleforge/backend-go/internal/credcrypto"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/strategy"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/ws"
@@ -43,6 +44,24 @@ func main() {
 	log.Println("migrations applied")
 
 	st := store.New(db)
+
+	// 凭证加密（WP2/C3）：配置了主密钥则加密子账户 API 密钥，否则明文（仅本地开发）。
+	cipher, err := credcrypto.FromString(cfg.CredentialEncKey)
+	if err != nil {
+		log.Fatalf("credential encryption key: %v", err)
+	}
+	st.SetCipher(cipher)
+	if cipher == nil {
+		log.Println("⚠️  CREDENTIAL_ENC_KEY 未设置：子账户 API 密钥将以明文落库（仅本地开发）")
+	}
+	if cfg.AuthToken == "" {
+		log.Println("⚠️  AUTH_TOKEN 未设置：API 无鉴权（仅本地开发；实盘前必须配置）")
+	}
+	if len(cfg.CORSOrigins) == 0 {
+		log.Println("⚠️  CORS_ORIGINS 未设置：反射任意来源（仅本地开发）")
+	}
+	// WS 升级来源白名单（与 HTTP CORS 收紧一致）。
+	ws.SetAllowedOrigins(cfg.CORSOrigins)
 
 	// Python 回测服务 gRPC 客户端
 	quant, err := grpcclient.New(cfg.QuantAddr)
@@ -195,6 +214,7 @@ func main() {
 	// HTTP 服务
 	srv := api.New(db, st, quant, src, live, hub, brokers, riskEngine, envInfo)
 	srv.SetManager(mgr)
+	srv.SetSecurity(cfg.AuthToken, cfg.CORSOrigins)
 	if err := srv.Router().Run(cfg.HTTPAddr); err != nil {
 		log.Fatalf("http server: %v", err)
 	}

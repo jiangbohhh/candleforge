@@ -10,9 +10,31 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// allowedOrigins 为 WS 升级的来源白名单；为空表示放开（仅本地开发）。
+// 由 main.go 在启动时通过 SetAllowedOrigins 注入。
+var allowedOrigins []string
+
+// SetAllowedOrigins 配置 WS 升级允许的 Origin 白名单（CORS 收紧的一部分）。
+func SetAllowedOrigins(origins []string) {
+	allowedOrigins = origins
+}
+
 var upgrader = websocket.Upgrader{
-	// M1 开发期放开跨域；生产应收紧。
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		if len(allowedOrigins) == 0 {
+			return true // 未配置白名单 → 开发模式放开
+		}
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return false // 白名单模式下拒绝无 Origin 的跨源请求
+		}
+		for _, o := range allowedOrigins {
+			if o == origin || o == "*" {
+				return true
+			}
+		}
+		return false
+	},
 }
 
 // Hub 维护所有前端连接，并向其广播消息。
