@@ -122,10 +122,16 @@ func (g *LiveGrid) Start(ctx context.Context) error {
 		}
 	}
 
-	// 铺所有网格限价单（intent-log 三步）
+	// 铺所有网格限价单（intent-log 三步）。
+	// H11: 任一层失败即补偿性回滚整批——撤全部已下单 + 清掉初始建仓，返回错误。
+	// 否则旧单残留交易所、其后续成交不被跟踪（真金白银无人认领）。
 	for _, o := range SortedLevelOrders(orders) {
 		if err := g.placeGridOrder(ctx, o.Level, o.Side, o.Price, o.Qty); err != nil {
-			log.Printf("grid %d: place level %d %s@%.2f: %v", g.row.ID, o.Level, o.Side, o.Price, err)
+			log.Printf("grid %d: place level %d %s@%.2f failed, rolling back batch: %v", g.row.ID, o.Level, o.Side, o.Price, err)
+			if serr := g.Stop(ctx, true); serr != nil {
+				log.Printf("grid %d: compensating stop after start failure: %v", g.row.ID, serr)
+			}
+			return fmt.Errorf("place level %d %s@%.2f: %w", o.Level, o.Side, o.Price, err)
 		}
 	}
 
@@ -157,13 +163,18 @@ func (g *LiveGrid) OnOrderUpdate(ctx context.Context, o *store.OrderRow) error {
 		return nil
 	}
 
-	// 更新引擎状态
-	next := g.eng.OnFill(matched.GridLevel, matched.Side)
-
-	// 标记 intent 已处理
-	if err := g.st.MarkIntentProcessed(ctx, matched.ID); err != nil {
+	// 先原子认领消费权（processed false→true），再改引擎状态。
+	// 这样即使后续步骤失败、Reconcile 重试，也不会对同一 intent 二次 OnFill（H8）。
+	claimed, err := g.st.ClaimIntentProcessed(ctx, matched.ID)
+	if err != nil {
 		return err
 	}
+	if !claimed {
+		return nil // 已被之前的 tick/重启消费
+	}
+
+	// 更新引擎状态（认领成功后恰好一次）
+	next := g.eng.OnFill(matched.GridLevel, matched.Side)
 
 	// 挂反向补单
 	if next.Qty > 0 {

@@ -9,6 +9,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/adshao/go-binance/v2/futures"
 
@@ -63,6 +64,9 @@ type BinanceFuturesBroker struct {
 	accountID int64
 	opts      BinanceFuturesOptions
 	uds       *futuresUserDataStream
+
+	levMu  sync.Mutex      // 保护 levSet
+	levSet map[string]bool // 已确认设为 1x 杠杆的 native symbol
 }
 
 // NewBinanceFuturesBroker 构造 broker：设单向持仓模式 → 同步余额/持仓 → 启动 UDS。
@@ -70,7 +74,7 @@ type BinanceFuturesBroker struct {
 func NewBinanceFuturesBroker(ctx context.Context, st *store.Store, hub *ws.Hub, bus *events.Bus, accountID int64, opts BinanceFuturesOptions) (*BinanceFuturesBroker, error) {
 	c := futures.NewClient(opts.APIKey, opts.APISecret)
 	c.BaseURL = opts.restBase()
-	b := &BinanceFuturesBroker{client: c, store: st, hub: hub, bus: bus, accountID: accountID, opts: opts}
+	b := &BinanceFuturesBroker{client: c, store: st, hub: hub, bus: bus, accountID: accountID, opts: opts, levSet: map[string]bool{}}
 
 	// 强制单向持仓模式；已是单向时交易所返回 -4059，视为成功。
 	if err := c.NewChangePositionModeService().DualSide(false).Do(ctx); err != nil &&
@@ -136,6 +140,12 @@ func (b *BinanceFuturesBroker) PlaceOrder(ctx context.Context, req PlaceOrderReq
 		return nil, err
 	}
 
+	// C6: 交易前确保该 symbol 在交易所是 1x 杠杆（全系统按 1x 建模，Binance 默认约 20x）。
+	// 失败即拒绝下单，绝不在未知杠杆下开仓。
+	if err := b.ensureLeverage(ctx, native); err != nil {
+		return nil, err
+	}
+
 	localID, _, err := b.store.InsertOrder(ctx, store.InsertOrderParams{
 		AccountID:  req.AccountID,
 		Symbol:     req.Symbol,
@@ -149,8 +159,13 @@ func (b *BinanceFuturesBroker) PlaceOrder(ctx context.Context, req PlaceOrderReq
 		return nil, err
 	}
 
+	// C2: 幂等 clientOrderId，落库后随 REST 提交。
+	coid := clientOrderID(localID)
+	_ = b.store.SetClientOrderID(ctx, localID, coid)
+
 	svc := b.client.NewCreateOrderService().
 		Symbol(native).
+		NewClientOrderID(coid).
 		Quantity(strconv.FormatFloat(req.Quantity, 'f', -1, 64))
 
 	if req.Side == "sell" {
@@ -172,19 +187,46 @@ func (b *BinanceFuturesBroker) PlaceOrder(ctx context.Context, req PlaceOrderReq
 
 	resp, err := svc.Do(ctx)
 	if err != nil {
+		// M15: 超时/网络错误 ≠ 拒单。先按 clientOrderId 查是否已受理，已受理则收养。
+		if got, qerr := b.client.NewGetOrderService().Symbol(native).OrigClientOrderID(coid).Do(ctx); qerr == nil && got != nil {
+			b.adoptOrder(ctx, localID, got.OrderID, mapBinanceStatusString(string(got.Status)), got.ExecutedQuantity)
+			return b.store.GetOrder(ctx, localID)
+		}
 		_ = b.store.UpdateOrderStatus(ctx, localID, "rejected")
 		b.broadcastOrder(localID)
 		return nil, err
 	}
 
-	brokerOID := strconv.FormatInt(resp.OrderID, 10)
-	_ = b.store.SetOrderBrokerOrderID(ctx, localID, brokerOID)
-	status := mapBinanceStatusString(string(resp.Status))
-	filled, _ := strconv.ParseFloat(resp.ExecutedQuantity, 64)
+	b.adoptOrder(ctx, localID, resp.OrderID, mapBinanceStatusString(string(resp.Status)), resp.ExecutedQuantity)
+	return b.store.GetOrder(ctx, localID)
+}
+
+// ensureLeverage 把指定 symbol 的杠杆设为 1x 并回读校验（每 symbol 一次，结果缓存）。
+// 交易所返回的实际杠杆必须为 1，否则报错——避免在默认高杠杆下开仓。
+func (b *BinanceFuturesBroker) ensureLeverage(ctx context.Context, native string) error {
+	b.levMu.Lock()
+	defer b.levMu.Unlock()
+	if b.levSet[native] {
+		return nil
+	}
+	res, err := b.client.NewChangeLeverageService().Symbol(native).Leverage(1).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("set 1x leverage for %s: %w", native, err)
+	}
+	if res == nil || res.Leverage != 1 {
+		return fmt.Errorf("leverage for %s not 1x after set (got %v)", native, res)
+	}
+	b.levSet[native] = true
+	log.Printf("binance futures: %s leverage set to 1x", native)
+	return nil
+}
+
+// adoptOrder 把交易所订单信息回写到本地行并广播。
+func (b *BinanceFuturesBroker) adoptOrder(ctx context.Context, localID, brokerOrderID int64, status, execQty string) {
+	_ = b.store.SetOrderBrokerOrderID(ctx, localID, strconv.FormatInt(brokerOrderID, 10))
+	filled, _ := strconv.ParseFloat(execQty, 64)
 	_ = b.store.UpdateOrderFill(ctx, localID, status, filled)
 	b.broadcastOrder(localID)
-
-	return b.store.GetOrder(ctx, localID)
 }
 
 // CancelOrder 走 fapi 撤单；本地状态由 UDS 兜底，但请求成功即写一次。

@@ -382,11 +382,20 @@ func (s *Store) AttachOrderID(ctx context.Context, intentID, orderID int64) erro
 	return err
 }
 
-// MarkIntentProcessed 标记 intent 已被引擎消费（幂等）。
-func (s *Store) MarkIntentProcessed(ctx context.Context, intentID int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE strategy_orders SET processed=true, updated_at=now() WHERE id=$1`, intentID)
-	return err
+// ClaimIntentProcessed 原子地把 intent 从未消费迁移到已消费，作为「引擎恰好消费一次」
+// 的权威闸门。返回 true 表示本次调用赢得了消费权；false 表示已被之前的 tick/重启消费，
+// 调用方必须跳过 OnFill，避免库存翻倍/补单重复（H8）。
+func (s *Store) ClaimIntentProcessed(ctx context.Context, intentID int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE strategy_orders SET processed=true, updated_at=now() WHERE id=$1 AND processed=false`, intentID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // DeactivateAllIntents 停止策略时将全部活动 intent 置为 inactive。

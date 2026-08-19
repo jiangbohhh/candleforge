@@ -23,6 +23,13 @@ const (
 	BinanceMainnetWSBase   = "wss://ws-api.binance.com/ws-api/v3"
 )
 
+// clientOrderID 由本地订单 ID 生成幂等的交易所 clientOrderId（≤36 字符，
+// 字母数字，Binance 现货/合约通用）。同一本地订单重试用同一 ID，可在 REST
+// 超时后按其查单，避免重复下单。
+func clientOrderID(localID int64) string {
+	return fmt.Sprintf("cf%d", localID)
+}
+
 // BinanceOptions 构造 BinanceBroker 所需的参数。
 type BinanceOptions struct {
 	APIKey, APISecret string
@@ -113,7 +120,8 @@ func (b *BinanceBroker) SyncBalances(ctx context.Context) error {
 		}
 		// 假设所有非 USDT 持仓的 quote 都是 USDT；如未来需扩展，可换成 SymbolByBase 查询。
 		sym := market.FromNative(bal.Asset, "USDT")
-		if err := b.store.UpsertPositionRaw(ctx, b.accountID, sym, total, 0); err != nil {
+		// C4: 现货接口不返回成本价，从本地成交流水复算加权均价。
+		if err := b.store.UpsertSpotPositionWithCost(ctx, b.accountID, sym, total); err != nil {
 			return err
 		}
 	}
@@ -141,8 +149,13 @@ func (b *BinanceBroker) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 		return nil, err
 	}
 
+	// C2: 生成与本地订单绑定的幂等 clientOrderId，落库后随 REST 提交。
+	coid := clientOrderID(localID)
+	_ = b.store.SetClientOrderID(ctx, localID, coid)
+
 	svc := b.client.NewCreateOrderService().
 		Symbol(native).
+		NewClientOrderID(coid).
 		Quantity(strconv.FormatFloat(req.Quantity, 'f', -1, 64))
 
 	if req.Side == "sell" {
@@ -161,19 +174,28 @@ func (b *BinanceBroker) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (
 
 	resp, err := svc.Do(ctx)
 	if err != nil {
+		// M15: 超时/网络错误 ≠ 拒单。先按 clientOrderId 查交易所是否已受理，
+		// 已受理则收养，确认未受理才标 rejected，避免「可能已成交的订单被标
+		// rejected 后无人跟踪」以及重试造成的双倍仓位。
+		if got, qerr := b.client.NewGetOrderService().Symbol(native).OrigClientOrderID(coid).Do(ctx); qerr == nil && got != nil {
+			b.adoptOrder(ctx, localID, got.OrderID, mapBinanceStatus(got.Status), got.ExecutedQuantity)
+			return b.store.GetOrder(ctx, localID)
+		}
 		_ = b.store.UpdateOrderStatus(ctx, localID, "rejected")
 		b.broadcastOrder(localID)
 		return nil, err
 	}
 
-	brokerOID := strconv.FormatInt(resp.OrderID, 10)
-	_ = b.store.SetOrderBrokerOrderID(ctx, localID, brokerOID)
-	status := mapBinanceStatus(resp.Status)
-	filled, _ := strconv.ParseFloat(resp.ExecutedQuantity, 64)
+	b.adoptOrder(ctx, localID, resp.OrderID, mapBinanceStatus(resp.Status), resp.ExecutedQuantity)
+	return b.store.GetOrder(ctx, localID)
+}
+
+// adoptOrder 把交易所订单信息回写到本地行并广播。
+func (b *BinanceBroker) adoptOrder(ctx context.Context, localID, brokerOrderID int64, status, execQty string) {
+	_ = b.store.SetOrderBrokerOrderID(ctx, localID, strconv.FormatInt(brokerOrderID, 10))
+	filled, _ := strconv.ParseFloat(execQty, 64)
 	_ = b.store.UpdateOrderFill(ctx, localID, status, filled)
 	b.broadcastOrder(localID)
-
-	return b.store.GetOrder(ctx, localID)
 }
 
 // CancelOrder 走 Binance REST 撤单；本地状态由 UDS 兜底，但请求成功即写一次。

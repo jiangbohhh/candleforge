@@ -171,6 +171,7 @@ func (u *userDataStream) handleExecutionReport(msg []byte) {
 		LastFillPrice string `json:"L"`
 		CumFilledQty  string `json:"z"`
 		Fee           string `json:"n"`
+		TradeID       int64  `json:"t"`
 		EventTime     int64  `json:"E"`
 	}
 	if err := json.Unmarshal(msg, &r); err != nil {
@@ -200,7 +201,7 @@ func (u *userDataStream) handleExecutionReport(msg []byte) {
 			side = "sell"
 		}
 		tradedAt := time.UnixMilli(r.EventTime)
-		if err := u.broker.store.InsertTradeFull(ctx, local.ID, local.Symbol, side, lp, lq, fee, tradedAt); err != nil {
+		if err := u.broker.store.InsertTradeFull(ctx, local.ID, r.TradeID, local.Symbol, side, lp, lq, fee, tradedAt); err != nil {
 			log.Printf("binance UDS: insert trade for order %d: %v", local.ID, err)
 		}
 		if u.broker.hub != nil {
@@ -239,7 +240,8 @@ func (u *userDataStream) handleAccountUpdate(msg []byte) {
 			continue
 		}
 		sym := market.FromNative(bal.Asset, "USDT")
-		_ = u.broker.store.UpsertPositionRaw(ctx, u.broker.accountID, sym, total, 0)
+		// C4: 均价从本地成交复算，而非写 0。
+		_ = u.broker.store.UpsertSpotPositionWithCost(ctx, u.broker.accountID, sym, total)
 	}
 }
 

@@ -96,6 +96,21 @@ func (m *Manager) resumeOne(ctx context.Context, row store.StrategyRow) error {
 	}
 	r := newRunner(row.ID, row.Kind, impl, m.env.Store, m.emitStrategyRaw)
 	r.onExit = m.runnerExitHandler(row.ID)
+
+	// H9: 撤销孤儿订单——有 strategy_id、status=new、却无 active intent 对应的挂单，
+	// 是崩溃在下单三步之间残留的无跟踪单。恢复时清掉，避免其成交后库存永久漂移。
+	if br, berr := m.env.Brokers(row.AccountID); berr == nil {
+		if orphans, oerr := m.env.Store.ListOrphanStrategyOrders(ctx, row.ID); oerr == nil {
+			for _, o := range orphans {
+				if err := br.CancelOrder(ctx, row.AccountID, o.ID); err != nil {
+					log.Printf("strategy %d: cancel orphan order %d: %v", row.ID, o.ID, err)
+				} else {
+					log.Printf("strategy %d: canceled orphan order %d", row.ID, o.ID)
+				}
+			}
+		}
+	}
+
 	if err := r.safeReconcile(ctx); err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}

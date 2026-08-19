@@ -88,8 +88,107 @@ func (b *SimBroker) matchLoop() {
 			return
 		case <-ticker.C:
 			b.matchLimitOrders()
+			b.checkLiquidations()
 		}
 	}
+}
+
+// perpMaintenanceMarginRate 与回测 backtest.maintenanceMarginRate 对齐（Binance USDT-M 第一档近似）。
+const perpMaintenanceMarginRate = 0.005
+
+// checkLiquidations 扫描所有永续持仓，权益跌破维持保证金即按现价强平（对齐回测口径，C7）。
+func (b *SimBroker) checkLiquidations() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ctx := context.Background()
+	positions, err := b.store.ListOpenPerpPositions(ctx)
+	if err != nil {
+		log.Printf("sim broker liquidation scan: %v", err)
+		return
+	}
+	for _, p := range positions {
+		price := b.priceFn(p.Symbol)
+		if price <= 0 {
+			continue
+		}
+		acct, err := b.store.GetAccount(ctx, p.AccountID)
+		if err != nil {
+			continue
+		}
+		notional := abs(p.Quantity) * price
+		equity := acct.Cash + p.Quantity*price
+		if equity > perpMaintenanceMarginRate*notional {
+			continue
+		}
+		if err := b.forceLiquidate(ctx, p, price); err != nil {
+			log.Printf("sim liquidation account %d %s: %v", p.AccountID, p.Symbol, err)
+			continue
+		}
+		log.Printf("sim liquidation: account %d %s flattened at %.8f (equity %.8f, notional %.8f)",
+			p.AccountID, p.Symbol, price, equity, notional)
+	}
+}
+
+// forceLiquidate 按现价平掉一笔永续持仓：建市价平仓单 → 单事务内结清现金/持仓/成交。
+// 不复用 executeFill（其买入侧有现金不足即挂起的保护，强平必须无条件成交）。
+func (b *SimBroker) forceLiquidate(ctx context.Context, p store.Position, price float64) error {
+	side := "sell"
+	qty := p.Quantity
+	if qty < 0 {
+		side = "buy"
+		qty = -qty
+	}
+	orderID, _, err := b.store.InsertOrder(ctx, store.InsertOrderParams{
+		AccountID: p.AccountID,
+		Symbol:    p.Symbol,
+		Side:      side,
+		OrderType: "market",
+		Quantity:  qty,
+	})
+	if err != nil {
+		return err
+	}
+
+	tx, err := b.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 平仓现金流：卖出 → +现金；买回 → -现金（签名一致）。
+	cashDelta := price * qty
+	if side == "buy" {
+		cashDelta = -cashDelta
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET cash=cash+$1 WHERE id=$2`, cashDelta, p.AccountID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE orders SET status='filled', filled_qty=quantity WHERE id=$1`, orderID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE positions SET quantity=0, avg_price=0, updated_at=now()
+		WHERE account_id=$1 AND symbol=$2`, p.AccountID, p.Symbol); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO trades (order_id, symbol, side, price, quantity)
+		VALUES ($1,$2,$3,$4,$5)`, orderID, p.Symbol, side, price, qty); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	b.broadcastOrder(orderID)
+	if b.hub != nil {
+		b.hub.BroadcastEvent("trade", map[string]any{
+			"orderId": orderID, "symbol": p.Symbol, "side": side,
+			"price": price, "quantity": qty, "liquidation": true,
+			"tradedAt": time.Now().UTC(),
+		})
+	}
+	return nil
 }
 
 // matchLimitOrders fetches all pending limit orders and fills those whose price conditions are met.

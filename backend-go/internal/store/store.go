@@ -380,6 +380,7 @@ type OrderRow struct {
 	FilledQty     float64   `json:"filledQty"`
 	Status        string    `json:"status"`
 	BrokerOrderID string    `json:"brokerOrderId,omitempty"`
+	ClientOrderID string    `json:"clientOrderId,omitempty"`
 	StrategyID    int64     `json:"strategyId,omitempty"`
 	CreatedAt     time.Time `json:"createdAt"`
 }
@@ -409,19 +410,20 @@ func (s *Store) UpdateOrderStatus(ctx context.Context, id int64, status string) 
 func (s *Store) GetOrder(ctx context.Context, id int64) (*OrderRow, error) {
 	var o OrderRow
 	var price, filledQty sql.NullFloat64
-	var brokerOID sql.NullString
+	var brokerOID, clientOID sql.NullString
 	var strategyID sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, broker_order_id, strategy_id, created_at
+		`SELECT id, account_id, symbol, side, type, price, quantity, COALESCE(filled_qty,0), status, broker_order_id, client_order_id, strategy_id, created_at
 		 FROM orders WHERE id=$1`, id).Scan(
 		&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
-		&price, &o.Quantity, &filledQty, &o.Status, &brokerOID, &strategyID, &o.CreatedAt)
+		&price, &o.Quantity, &filledQty, &o.Status, &brokerOID, &clientOID, &strategyID, &o.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	o.Price = price.Float64
 	o.FilledQty = filledQty.Float64
 	o.BrokerOrderID = brokerOID.String
+	o.ClientOrderID = clientOID.String
 	o.StrategyID = strategyID.Int64
 	return &o, nil
 }
@@ -509,10 +511,31 @@ func (s *Store) GetPosition(ctx context.Context, accountID int64, symbol string)
 	return &p, nil
 }
 
-func (s *Store) ListPositions(ctx context.Context, accountID int64) ([]PositionView, error) {
+// ListOpenPerpPositions 返回所有账户下非零的永续持仓（供 SimBroker 强平扫描）。
+func (s *Store) ListOpenPerpPositions(ctx context.Context) ([]Position, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, account_id, symbol, quantity, avg_price FROM positions
-		 WHERE account_id=$1 AND quantity > 0
+		 WHERE quantity <> 0 AND symbol LIKE '%.PERP'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Position
+	for rows.Next() {
+		var p Position
+		if err := rows.Scan(&p.ID, &p.AccountID, &p.Symbol, &p.Quantity, &p.AvgPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListPositions(ctx context.Context, accountID int64) ([]PositionView, error) {
+	// 不过滤符号方向：永续空头为负仓位，也需在持仓/汇总中可见（H1）。仅隐藏已平（0）仓位。
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, account_id, symbol, quantity, avg_price FROM positions
+		 WHERE account_id=$1 AND quantity <> 0
 		 ORDER BY symbol`, accountID)
 	if err != nil {
 		return nil, err
@@ -616,6 +639,13 @@ func (s *Store) SetOrderBrokerOrderID(ctx context.Context, localID int64, broker
 	return err
 }
 
+// SetClientOrderID 在 REST 下单前写入本地生成的幂等 clientOrderId。
+func (s *Store) SetClientOrderID(ctx context.Context, localID int64, clientOrderID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE orders SET client_order_id=$1 WHERE id=$2`, clientOrderID, localID)
+	return err
+}
+
 // GetOrderByBrokerOrderID 用交易所订单号反查本地订单，供 UserDataStream 路由事件。
 func (s *Store) GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*OrderRow, error) {
 	var id int64
@@ -635,12 +665,63 @@ func (s *Store) UpdateOrderFill(ctx context.Context, localID int64, status strin
 }
 
 // InsertTradeFull 写一行成交（用于 UDS 上报真实成交，带费率/时间）。
-func (s *Store) InsertTradeFull(ctx context.Context, orderID int64, symbol, side string, price, quantity, fee float64, tradedAt time.Time) error {
+// tradeID 为交易所成交 ID；(symbol, trade_id) 唯一，重复推送/断线重放经
+// ON CONFLICT DO NOTHING 幂等丢弃，避免已实现盈亏被重复计算（H2）。
+func (s *Store) InsertTradeFull(ctx context.Context, orderID, tradeID int64, symbol, side string, price, quantity, fee float64, tradedAt time.Time) error {
+	var tid interface{}
+	if tradeID != 0 {
+		tid = tradeID
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO trades (order_id, symbol, side, price, quantity, fee, traded_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		orderID, symbol, side, price, quantity, fee, tradedAt)
+		INSERT INTO trades (order_id, symbol, side, price, quantity, fee, traded_at, trade_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (symbol, trade_id) DO NOTHING`,
+		orderID, symbol, side, price, quantity, fee, tradedAt, tid)
 	return err
+}
+
+// WeightedAvgCost 从本地成交流水重建某标的的加权平均成本（现货用）。
+// Binance 现货账户接口不返回成本价，改由我们记录的 trades 复算（C4）。
+// 若无本地成交（持仓早于本服务记账），返回 0（调用方应据此禁用浮盈展示）。
+func (s *Store) WeightedAvgCost(ctx context.Context, accountID int64, symbol string) (float64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.side, t.price, t.quantity
+		FROM trades t JOIN orders o ON t.order_id=o.id
+		WHERE o.account_id=$1 AND t.symbol=$2
+		ORDER BY t.id`, accountID, symbol)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var qty, avg float64
+	for rows.Next() {
+		var side string
+		var price, q float64
+		if err := rows.Scan(&side, &price, &q); err != nil {
+			return 0, err
+		}
+		if side == "buy" {
+			if qty+q > 0 {
+				avg = (avg*qty + price*q) / (qty + q)
+			}
+			qty += q
+		} else { // sell：减仓，均价不变
+			qty -= q
+			if qty <= 0 {
+				qty, avg = 0, 0
+			}
+		}
+	}
+	return avg, rows.Err()
+}
+
+// UpsertSpotPositionWithCost 用交易所返回的数量 + 从本地成交复算的均价写入现货持仓。
+func (s *Store) UpsertSpotPositionWithCost(ctx context.Context, accountID int64, symbol string, quantity float64) error {
+	avg, err := s.WeightedAvgCost(ctx, accountID, symbol)
+	if err != nil {
+		return err
+	}
+	return s.UpsertPositionRaw(ctx, accountID, symbol, quantity, avg)
 }
 
 // UpsertPositionRaw 直接写入（覆盖）持仓数量与均价；不做加权融合。

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -183,9 +184,13 @@ func main() {
 		log.Printf("Binance futures broker disabled (BINANCE_FUTURES_API_KEY missing)")
 	}
 
-	// BrokerFor 解析器：按 accountID 查 accounts 行，路由到对应 broker 实例。
-	// 当前实现：sim 子账户走共享 SimBroker；live 主账户走 brokers["binance"]（若有）。
-	// Phase D 后续迭代：live 子账户按 api_key 动态构建独立 BinanceBroker。
+	// BrokerFor 解析器：按 accountID 路由到正确的 broker 实例。
+	// - accountID==0 或 sim 账户 → 共享 SimBroker
+	// - live 主账户 → brokers["binance"/"binance_futures"]
+	// - live 子账户 → 按其自身凭证动态实例化独立 Broker（含独立 UDS），按 accountID 缓存（C5）。
+	//   绝不返回与请求 accountID 不符的 Broker（旧实现会把子账户单发到父账户密钥）。
+	var subMu sync.Mutex
+	subBrokers := map[int64]broker.Broker{}
 	brokerFor := func(accountID int64) (broker.Broker, error) {
 		if accountID == 0 {
 			return simBroker, nil
@@ -194,11 +199,48 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("account %d: %w", accountID, err)
 		}
-		if b, ok := brokers[acct.Broker]; ok {
+		// 非子账户（主账户/sim）：直接查 brokers 表。
+		if acct.Kind != "sub" {
+			if b, ok := brokers[acct.Broker]; ok {
+				return b, nil
+			}
+			return simBroker, nil
+		}
+		// sim 子账户共享 SimBroker。
+		if acct.Broker == "sim" {
+			return simBroker, nil
+		}
+		// live 子账户：按自身凭证动态构建并缓存。
+		subMu.Lock()
+		defer subMu.Unlock()
+		if b, ok := subBrokers[accountID]; ok {
 			return b, nil
 		}
-		// sub 账户的 broker 列跟随父账户
-		return simBroker, nil
+		sub, err := st.GetSubAccount(ctx, accountID) // 内部解密凭证
+		if err != nil {
+			return nil, fmt.Errorf("load sub-account %d: %w", accountID, err)
+		}
+		if sub.APIKey == "" || sub.APISecret == "" {
+			return nil, fmt.Errorf("live sub-account %d has no credentials", accountID)
+		}
+		var nb broker.Broker
+		switch acct.Broker {
+		case "binance":
+			nb, err = broker.NewBinanceBroker(ctx, st, hub, eventBus, accountID, broker.BinanceOptions{
+				APIKey: sub.APIKey, APISecret: sub.APISecret, Mainnet: cfg.BinanceMainnet,
+			})
+		case "binance_futures":
+			nb, err = broker.NewBinanceFuturesBroker(ctx, st, hub, eventBus, accountID, broker.BinanceFuturesOptions{
+				APIKey: sub.APIKey, APISecret: sub.APISecret, Mainnet: cfg.BinanceMainnet,
+			})
+		default:
+			return nil, fmt.Errorf("unsupported sub-account broker %q for account %d", acct.Broker, accountID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("build broker for sub-account %d: %w", accountID, err)
+		}
+		subBrokers[accountID] = nb
+		return nb, nil
 	}
 
 	// M6 策略引擎

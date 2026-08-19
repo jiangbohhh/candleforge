@@ -266,6 +266,13 @@ func (s *Server) transferStrategyFunds(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "sub account not found"})
 		return
 	}
+	// H12: live 账户的 cash 是交易所余额镜像，本地划转会制造「幽灵资金」
+	// （下一次 UDS 余额事件覆盖父账户后，同一笔钱在父子两个台账同时存在）。
+	// 实盘划转必须在交易所侧完成（universalTransfer）；这里对 live 子账户硬失败。
+	if sub.Broker != "sim" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "live sub-account funds must be transferred on the exchange, not via this API"})
+		return
+	}
 	var fromID, toID int64
 	amount := body.Amount
 	reason := "allocate"

@@ -137,6 +137,7 @@ func (u *futuresUserDataStream) handleOrderTradeUpdate(msg []byte) {
 			LastFillPrice string `json:"L"`
 			CumFilledQty  string `json:"z"`
 			Fee           string `json:"n"`
+			TradeID       int64  `json:"t"`
 		} `json:"o"`
 	}
 	if err := json.Unmarshal(msg, &r); err != nil {
@@ -165,7 +166,7 @@ func (u *futuresUserDataStream) handleOrderTradeUpdate(msg []byte) {
 			side = "sell"
 		}
 		tradedAt := time.UnixMilli(r.EventTime)
-		if err := u.broker.store.InsertTradeFull(ctx, local.ID, local.Symbol, side, lp, lq, fee, tradedAt); err != nil {
+		if err := u.broker.store.InsertTradeFull(ctx, local.ID, r.Order.TradeID, local.Symbol, side, lp, lq, fee, tradedAt); err != nil {
 			log.Printf("binance futures UDS: insert trade for order %d: %v", local.ID, err)
 		}
 		if u.broker.hub != nil {

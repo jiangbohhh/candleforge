@@ -112,35 +112,41 @@ func (e *Engine) Validate(ctx context.Context, accountID int64, symbol, side, or
 		return fmt.Errorf("order notional %.2f exceeds per-order cap %.2f", notional, maxNotional)
 	}
 
+	if market.IsPerp(symbol) {
+		// 永续 1x：用权益口径的可用保证金做闸门，而非被空头开仓虚增的原始现金（C7）。
+		// 模型：equity = cash + inv×price（签名仓位）；1x 下所需保证金 = |newInv|×price。
+		// 交易后必须 equity ≥ |newInv|×price，这样多空双向都被硬限制在 1x，
+		// 空头无法靠"卖出所得先入账"无限叠加。
+		inv := 0.0
+		if pos, err := e.st.GetPosition(ctx, accountID, symbol); err == nil && pos != nil {
+			inv = pos.Quantity
+		}
+		delta := quantity
+		if side == "sell" {
+			delta = -quantity
+		}
+		newInv := inv + delta
+		// 公平价成交下 equity 不变，用当前 cash+inv×price 估算交易后权益。
+		equity := acct.Cash + inv*refPrice
+		requiredMargin := math.Abs(newInv) * refPrice
+		if equity < requiredMargin-1e-9 {
+			return fmt.Errorf("insufficient margin (1x): equity %.8f < required %.8f", equity, requiredMargin)
+		}
+		return nil
+	}
+
 	switch side {
 	case "buy":
 		if acct.Cash < notional {
 			return fmt.Errorf("insufficient cash: need %.8f, have %.8f", notional, acct.Cash)
 		}
 	case "sell":
-		if market.IsPerp(symbol) {
-			// 永续允许卖出开空（1x 全额保证金）：超出现有多仓的部分按名义额校验现金。
-			// 注：sim 台账中空头开仓所得现金先入账，此处为近似校验；
-			// 策略级最坏占用预检（grid live Start）是主防线。
-			held := 0.0
-			if pos, err := e.st.GetPosition(ctx, accountID, symbol); err == nil && pos != nil {
-				held = math.Max(pos.Quantity, 0)
-			}
-			opening := quantity - held
-			if opening > 0 {
-				need := refPrice * opening
-				if acct.Cash < need {
-					return fmt.Errorf("insufficient margin for short: need %.8f, have %.8f", need, acct.Cash)
-				}
-			}
-		} else {
-			pos, err := e.st.GetPosition(ctx, accountID, symbol)
-			if err != nil || pos == nil {
-				return fmt.Errorf("no position for %s", symbol)
-			}
-			if pos.Quantity < quantity {
-				return fmt.Errorf("insufficient quantity: have %.8f, want %.8f", pos.Quantity, quantity)
-			}
+		pos, err := e.st.GetPosition(ctx, accountID, symbol)
+		if err != nil || pos == nil {
+			return fmt.Errorf("no position for %s", symbol)
+		}
+		if pos.Quantity < quantity {
+			return fmt.Errorf("insufficient quantity: have %.8f, want %.8f", pos.Quantity, quantity)
 		}
 	}
 
