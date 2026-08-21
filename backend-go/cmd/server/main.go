@@ -114,10 +114,10 @@ func main() {
 		}
 		return 0
 	}
-	simBroker := broker.NewSimBroker(db, st, priceFn, hub, eventBus)
+	simBroker := broker.NewSimBroker(db, st, priceFn, hub, eventBus, cfg.SimCommission)
 
-	// 风控引擎：默认单笔上限 50,000 USDT，未启用紧急停止
-	riskEngine := risk.NewEngine(st, 50000)
+	// 风控引擎：单笔名义额上限可配置（RISK_MAX_NOTIONAL），未启用紧急停止
+	riskEngine := risk.NewEngine(st, cfg.RiskMaxNotional)
 
 	// 实盘 Binance Broker (M4) — 仅在 BINANCE_API_KEY/SECRET 配置时构造
 	brokers := map[string]broker.Broker{"sim": simBroker}

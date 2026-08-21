@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync/atomic"
 
 	"github.com/jiangbohhh/candleforge/backend-go/internal/broker"
 	"github.com/jiangbohhh/candleforge/backend-go/internal/risk"
@@ -21,8 +22,9 @@ type LiveGrid struct {
 	br      broker.Broker
 	risk    *risk.Engine
 	st      *store.Store
-	priceFn func(string) float64
-	emitFn  func(event string, data any)
+	priceFn  func(string) float64
+	emitFn   func(event string, data any)
+	stopping atomic.Bool
 }
 
 // NewLiveGrid 从 DB 行构建 LiveGrid 实例（恢复或全新）。
@@ -138,63 +140,108 @@ func (g *LiveGrid) Start(ctx context.Context) error {
 	return g.saveSnapshot(ctx)
 }
 
-// OnOrderUpdate 处理一笔订单成交（由 runner 串行调用）。
+// OnOrderUpdate 处理一笔订单状态更新（由 runner 串行调用）。
+// 部分成交只推进 consumed_qty；完全成交才 OnFill 翻层；部成后撤单重挂剩余量。
 func (g *LiveGrid) OnOrderUpdate(ctx context.Context, o *store.OrderRow) error {
-	if o.Status != "filled" {
-		return nil
-	}
-
-	// 查找该订单对应的 intent
-	intents, err := g.st.ListActiveIntents(ctx, g.row.ID)
+	intent, err := g.st.GetIntentByOrderID(ctx, g.row.ID, o.ID)
 	if err != nil {
 		return err
 	}
-	var matched *store.StrategyOrderRow
-	for i, intent := range intents {
-		if intent.OrderID == o.ID {
-			matched = &intents[i]
-			break
-		}
-	}
-	if matched == nil {
-		return nil // 非本策略订单或已处理
-	}
-	if matched.Processed {
+	if intent == nil {
 		return nil
 	}
 
-	// 先原子认领消费权（processed false→true），再改引擎状态。
-	// 这样即使后续步骤失败、Reconcile 重试，也不会对同一 intent 二次 OnFill（H8）。
-	claimed, err := g.st.ClaimIntentProcessed(ctx, matched.ID)
+	d := decideGridFill(o.Status, o.Quantity, o.FilledQty, intent.ConsumedQty, g.params.QtyPerGrid)
+	if d.trackOnly {
+		return g.st.TouchIntentConsumed(ctx, intent.ID, d.newConsumed)
+	}
+	if !d.markProcessed {
+		return nil
+	}
+	if intent.Processed {
+		return nil
+	}
+
+	if d.applyEngine {
+		return g.commitFill(ctx, intent, d.newConsumed)
+	}
+
+	// 撤单/拒单：认领 intent，必要时空档重挂（Stop 期间禁止重挂以免和清仓打架）。
+	claimed, err := g.st.ClaimIntentAndSaveState(ctx, intent.ID, g.row.ID, d.newConsumed, nil)
 	if err != nil {
 		return err
 	}
 	if !claimed {
-		return nil // 已被之前的 tick/重启消费
+		return nil
 	}
+	if d.replaceQty > 0 && !g.stopping.Load() {
+		if err := g.placeGridOrder(ctx, intent.GridLevel, intent.Side, intent.Price, d.replaceQty); err != nil {
+			log.Printf("grid %d: re-place remaining level %d %s qty=%.8f: %v",
+				g.row.ID, intent.GridLevel, intent.Side, d.replaceQty, err)
+		}
+	}
+	return nil
+}
 
-	// 更新引擎状态（认领成功后恰好一次）
-	next := g.eng.OnFill(matched.GridLevel, matched.Side)
+// commitFill 在引擎副本上 OnFill，与 intent 认领、状态快照同一事务落库后再补反向单。
+func (g *LiveGrid) commitFill(ctx context.Context, intent *store.StrategyOrderRow, consumed float64) error {
+	clone, err := cloneEngine(g.eng)
+	if err != nil {
+		return err
+	}
+	next := clone.OnFill(intent.GridLevel, intent.Side)
+	newSnap, err := clone.Snapshot()
+	if err != nil {
+		return err
+	}
+	claimed, err := g.st.ClaimIntentAndSaveState(ctx, intent.ID, g.row.ID, consumed, newSnap)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
+	}
+	g.eng = clone
 
-	// 挂反向补单
-	if next.Qty > 0 {
+	if next.Qty > 0 && !g.stopping.Load() {
 		if err := g.placeGridOrder(ctx, next.Level, next.Side, next.Price, next.Qty); err != nil {
 			log.Printf("grid %d:補單 level %d %s@%.2f: %v", g.row.ID, next.Level, next.Side, next.Price, err)
 		}
 	}
 
-	// 广播状态更新
-	snap, _ := g.eng.Snapshot()
-	_ = g.st.UpdateStrategyState(ctx, g.row.ID, snap)
 	g.emitFn("strategy", map[string]any{
 		"id":    g.row.ID,
-		"state": json.RawMessage(snap),
+		"state": json.RawMessage(newSnap),
 	})
 	return nil
 }
 
-// Reconcile 30s 周期兜底对账（检查停机期间的成交）。
+// cloneEngine 返回引擎的深拷贝（sides 等切片独立分配），用于在副本上试探 OnFill
+// 后再原子落库（H8）。副本与原引擎共享只读的 cfg/levels，但 sides 与 State 各自独立。
+func cloneEngine(src *Engine) (*Engine, error) {
+	snap, err := src.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	clone, err := New(src.cfg)
+	if err != nil {
+		return nil, err
+	}
+	var s State
+	if err := json.Unmarshal(snap, &s); err != nil {
+		return nil, err
+	}
+	clone.State = s
+	clone.sides = append([]string{}, s.Sides...)
+	return clone, nil
+}
+
+// Reconcile 30s 周期兜底对账（交易所挂单 vs 本地 → 消化未处理 intent → 补挂空洞）。
 func (g *LiveGrid) Reconcile(ctx context.Context) error {
+	if err := g.br.ReconcileOrders(ctx); err != nil {
+		log.Printf("grid %d broker reconcile: %v", g.row.ID, err)
+	}
+
 	unprocessed, err := g.st.ListUnprocessedIntents(ctx, g.row.ID)
 	if err != nil {
 		return err
@@ -208,11 +255,50 @@ func (g *LiveGrid) Reconcile(ctx context.Context) error {
 			log.Printf("grid %d reconcile intent %d: %v", g.row.ID, intent.ID, err)
 		}
 	}
+
+	// C1：补挂「active 但未落单」的悬空 intent（下单/风控失败留下的网格空洞）。
+	dangling, err := g.st.ListDanglingIntents(ctx, g.row.ID)
+	if err != nil {
+		return err
+	}
+	for _, intent := range dangling {
+		qty := intent.Qty
+		if qty <= 0 {
+			qty = g.params.QtyPerGrid
+		}
+		if err := g.retryDanglingIntent(ctx, intent, qty); err != nil {
+			log.Printf("grid %d reconcile re-place level %d %s@%.8f: %v",
+				g.row.ID, intent.GridLevel, intent.Side, intent.Price, err)
+		}
+	}
 	return nil
+}
+
+// retryDanglingIntent 对「已有 intent、尚未落单」的空洞直接重试 PlaceOrder，
+// 不再 InsertIntent（否则会先失活原 intent，失败后该层永久无单）。
+func (g *LiveGrid) retryDanglingIntent(ctx context.Context, intent store.StrategyOrderRow, qty float64) error {
+	if err := g.risk.Validate(ctx, g.row.AccountID, g.row.Symbol,
+		intent.Side, "limit", intent.Price, qty, g.priceFn); err != nil {
+		return fmt.Errorf("risk block: %w", err)
+	}
+	ord, err := g.br.PlaceOrder(ctx, broker.PlaceOrderRequest{
+		AccountID:  g.row.AccountID,
+		Symbol:     g.row.Symbol,
+		Side:       intent.Side,
+		OrderType:  "limit",
+		Price:      intent.Price,
+		Quantity:   qty,
+		StrategyID: g.row.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("place order: %w", err)
+	}
+	return g.st.AttachOrderID(ctx, intent.ID, ord.ID)
 }
 
 // Stop 撤单 + 可选清仓（liquidate=true 清仓）。
 func (g *LiveGrid) Stop(ctx context.Context, liquidate bool) error {
+	g.stopping.Store(true)
 	// 撤全部活动挂单
 	intents, err := g.st.ListActiveIntents(ctx, g.row.ID)
 	if err != nil {
@@ -255,17 +341,23 @@ func (g *LiveGrid) Stop(ctx context.Context, liquidate bool) error {
 // ── 内部 helpers ──
 
 // placeGridOrder 执行 intent-log 三步：①写 intent → ②broker.PlaceOrder → ③回写 order_id。
+// C1：任一步（②③）失败即失活该 intent，避免「active 但 order_id=0」的悬空 intent
+// 被部分唯一索引长期挡住该层重试。
 func (g *LiveGrid) placeGridOrder(ctx context.Context, level int, side string, price, qty float64) error {
 	// 步骤①
-	intentID, err := g.st.InsertIntent(ctx, g.row.ID, level, side, price, "grid")
+	intentID, err := g.st.InsertIntent(ctx, g.row.ID, level, side, price, qty, "grid")
 	if err != nil {
 		return fmt.Errorf("insert intent: %w", err)
+	}
+	fail := func(e error) error {
+		_ = g.st.DeactivateIntent(ctx, intentID)
+		return e
 	}
 
 	// 步骤② — 过风控
 	if err := g.risk.Validate(ctx, g.row.AccountID, g.row.Symbol,
 		side, "limit", price, qty, g.priceFn); err != nil {
-		return fmt.Errorf("risk block: %w", err)
+		return fail(fmt.Errorf("risk block: %w", err))
 	}
 	ord, err := g.br.PlaceOrder(ctx, broker.PlaceOrderRequest{
 		AccountID:  g.row.AccountID,
@@ -277,12 +369,12 @@ func (g *LiveGrid) placeGridOrder(ctx context.Context, level int, side string, p
 		StrategyID: g.row.ID,
 	})
 	if err != nil {
-		return fmt.Errorf("place order: %w", err)
+		return fail(fmt.Errorf("place order: %w", err))
 	}
 
 	// 步骤③
 	if err := g.st.AttachOrderID(ctx, intentID, ord.ID); err != nil {
-		return fmt.Errorf("attach order id: %w", err)
+		return fail(fmt.Errorf("attach order id: %w", err))
 	}
 	return nil
 }

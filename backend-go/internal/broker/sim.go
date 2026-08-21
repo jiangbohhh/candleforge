@@ -6,6 +6,7 @@ package broker
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -41,33 +42,41 @@ type Broker interface {
 	CancelOrder(ctx context.Context, accountID, orderID int64) error
 	ListOrders(ctx context.Context, accountID int64) ([]store.OrderRow, error)
 	GetPositions(ctx context.Context, accountID int64) ([]store.PositionView, error)
+	// ReconcileOrders 把本地未终态订单与交易所对齐。SimBroker 是本地真相，空操作。
+	ReconcileOrders(ctx context.Context) error
 }
 
 // PriceFunc returns the current price for a symbol, or 0 if unknown.
 type PriceFunc func(symbol string) float64
 
+// errInsufficientFunds 表示买入时现金不足，订单未能成交（区别于其它错误）。
+var errInsufficientFunds = errors.New("insufficient funds")
+
 // SimBroker matches orders against live market prices in-process.
 type SimBroker struct {
-	db      *sql.DB
-	store   *store.Store
-	priceFn PriceFunc
-	hub     *ws.Hub
-	bus     *events.Bus
-	mu      sync.Mutex
-	stopCh  chan struct{}
+	db         *sql.DB
+	store      *store.Store
+	priceFn    PriceFunc
+	hub        *ws.Hub
+	bus        *events.Bus
+	commission float64 // 手续费率；0 表示不收
+	mu         sync.Mutex
+	stopCh     chan struct{}
 }
 
 // NewSimBroker creates a SimBroker and starts its limit-order matching loop.
 // hub may be nil for tests; when non-nil it receives order/trade event broadcasts.
 // bus may be nil; when non-nil filled orders are published to the strategy engine.
-func NewSimBroker(db *sql.DB, st *store.Store, priceFn PriceFunc, hub *ws.Hub, bus *events.Bus) *SimBroker {
+// commission 是每笔成交手续费率（如 0.001 = 0.1%），与回测口径对齐（E3）。
+func NewSimBroker(db *sql.DB, st *store.Store, priceFn PriceFunc, hub *ws.Hub, bus *events.Bus, commission float64) *SimBroker {
 	sb := &SimBroker{
-		db:      db,
-		store:   st,
-		priceFn: priceFn,
-		hub:     hub,
-		bus:     bus,
-		stopCh:  make(chan struct{}),
+		db:         db,
+		store:      st,
+		priceFn:    priceFn,
+		hub:        hub,
+		bus:        bus,
+		commission: commission,
+		stopCh:     make(chan struct{}),
 	}
 	go sb.matchLoop()
 	return sb
@@ -232,14 +241,17 @@ func (b *SimBroker) executeFill(o store.PendingOrder, fillPrice float64) error {
 	}
 
 	cost := fillPrice * o.Quantity
+	fee := b.commission * cost
 
 	if o.Side == "buy" {
-		if cash < cost {
-			return nil // insufficient funds — leave order pending
+		if cash < cost+fee {
+			// H13：返回显式错误而非 nil，让市价单路径能据此标 rejected，
+			// 避免「资金不足的市价单永久卡在 new」。
+			return errInsufficientFunds
 		}
-		cash -= cost
+		cash -= cost + fee
 	} else {
-		cash += cost
+		cash += cost - fee
 	}
 
 	// Update account cash
@@ -294,11 +306,11 @@ func (b *SimBroker) executeFill(o store.PendingOrder, fillPrice float64) error {
 		return err
 	}
 
-	// Insert trade record
+	// Insert trade record（E3：记录手续费，与回测口径对齐）
 	if _, err := tx.Exec(`
-		INSERT INTO trades (order_id, symbol, side, price, quantity)
-		VALUES ($1,$2,$3,$4,$5)`,
-		o.ID, o.Symbol, o.Side, fillPrice, o.Quantity); err != nil {
+		INSERT INTO trades (order_id, symbol, side, price, quantity, fee)
+		VALUES ($1,$2,$3,$4,$5,$6)`,
+		o.ID, o.Symbol, o.Side, fillPrice, o.Quantity, fee); err != nil {
 		return err
 	}
 
@@ -380,7 +392,7 @@ func (b *SimBroker) CancelOrder(ctx context.Context, accountID, orderID int64) e
 	if o.AccountID != accountID {
 		return sql.ErrNoRows
 	}
-	if o.Status != "new" {
+	if o.Status != "new" && o.Status != "partially_filled" {
 		return nil // already terminal
 	}
 	if err := b.store.UpdateOrderStatus(ctx, orderID, "canceled"); err != nil {
@@ -393,6 +405,11 @@ func (b *SimBroker) CancelOrder(ctx context.Context, accountID, orderID int64) e
 // ListOrders returns orders for an account (most recent first).
 func (b *SimBroker) ListOrders(ctx context.Context, accountID int64) ([]store.OrderRow, error) {
 	return b.store.ListOrders(ctx, accountID, 100)
+}
+
+// ReconcileOrders 对模拟盘是空操作：撮合循环本身就是订单真相。
+func (b *SimBroker) ReconcileOrders(ctx context.Context) error {
+	return nil
 }
 
 // GetPositions returns current positions for an account.

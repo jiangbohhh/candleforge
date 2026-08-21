@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -44,6 +46,8 @@ type Hub struct {
 	broadcast  chan []byte
 	register   chan *client
 	unregister chan *client
+
+	dropped atomic.Int64 // 广播缓冲满被丢弃的消息数（F4 可观测性）
 }
 
 type client struct {
@@ -62,6 +66,8 @@ func NewHub() *Hub {
 
 // Run 启动 Hub 事件循环（在独立 goroutine 中调用）。
 func (h *Hub) Run() {
+	report := time.NewTicker(60 * time.Second)
+	defer report.Stop()
 	for {
 		select {
 		case c := <-h.register:
@@ -85,6 +91,11 @@ func (h *Hub) Run() {
 				}
 			}
 			h.mu.RUnlock()
+		case <-report.C:
+			// F4：周期上报丢弃计数，把静默丢弃变成可观测。
+			if n := h.dropped.Swap(0); n > 0 {
+				log.Printf("ws hub: dropped %d messages in last 60s (broadcast buffer full)", n)
+			}
 		}
 	}
 }
@@ -94,7 +105,7 @@ func (h *Hub) Broadcast(msg []byte) {
 	select {
 	case h.broadcast <- msg:
 	default:
-		// 广播缓冲满，丢弃本条
+		h.dropped.Add(1)
 	}
 }
 

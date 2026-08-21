@@ -403,7 +403,10 @@ func (s *Store) InsertOrder(ctx context.Context, p InsertOrderParams) (orderID, 
 }
 
 func (s *Store) UpdateOrderStatus(ctx context.Context, id int64, status string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE orders SET status=$1 WHERE id=$2`, status, id)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE orders SET status=$1 WHERE id=$2
+		AND `+orderStatusRankSQL("$1")+` >= `+orderStatusRankSQL("status"),
+		status, id)
 	return err
 }
 
@@ -495,8 +498,9 @@ type Position struct {
 // PositionView is a position enriched with current market price.
 type PositionView struct {
 	Position
-	MarketPrice float64 `json:"marketPrice"`
-	Unrealized  float64 `json:"unrealized"`
+	MarketPrice   float64 `json:"marketPrice"`
+	Unrealized    float64 `json:"unrealized"`
+	AvgPriceValid bool `json:"avgPriceValid"` // false=成本未知（持仓早于本服务记账），浮盈不可信应置 0
 }
 
 func (s *Store) GetPosition(ctx context.Context, accountID int64, symbol string) (*Position, error) {
@@ -547,6 +551,8 @@ func (s *Store) ListPositions(ctx context.Context, accountID int64) ([]PositionV
 		if err := rows.Scan(&pv.ID, &pv.AccountID, &pv.Symbol, &pv.Quantity, &pv.AvgPrice); err != nil {
 			return nil, err
 		}
+		// B1：成本未知（avg_price=0 且持仓非零）时浮盈不可信，标记给上层置 0。
+		pv.AvgPriceValid = pv.AvgPrice > 0 || pv.Quantity == 0
 		out = append(out, pv)
 	}
 	return out, rows.Err()
@@ -615,11 +621,14 @@ func (s *Store) AccountSummary(ctx context.Context, accountID int64, priceFn fun
 	)
 	for i := range positions {
 		mp := priceFn(positions[i].Symbol)
-		unrealized := (mp - positions[i].AvgPrice) * positions[i].Quantity
-		totalValue += mp * positions[i].Quantity
-		totalUnreal += unrealized
 		positions[i].MarketPrice = mp
-		positions[i].Unrealized = unrealized
+		// B1：成本未知（AvgPriceValid=false）则浮盈置 0，避免用 avg_price=0 算出全额假浮盈。
+		if positions[i].AvgPriceValid {
+			unrealized := (mp - positions[i].AvgPrice) * positions[i].Quantity
+			positions[i].Unrealized = unrealized
+			totalUnreal += unrealized
+		}
+		totalValue += mp * positions[i].Quantity
 	}
 
 	return &AccountSummary{
@@ -650,17 +659,52 @@ func (s *Store) SetClientOrderID(ctx context.Context, localID int64, clientOrder
 func (s *Store) GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*OrderRow, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM orders WHERE broker_order_id=$1`, brokerOrderID).Scan(&id)
+		`SELECT id FROM orders WHERE broker_order_id=$1 LIMIT 1`, brokerOrderID).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 	return s.GetOrder(ctx, id)
 }
 
+// ListOpenOrders 返回本地仍未终态的订单（挂单 + 部分成交），供与交易所对账。
+func (s *Store) ListOpenOrders(ctx context.Context, accountID int64) ([]OrderRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, symbol, side, type, COALESCE(price,0), quantity,
+		       COALESCE(filled_qty,0), status, COALESCE(broker_order_id,''),
+		       COALESCE(client_order_id,''), COALESCE(strategy_id,0), created_at
+		FROM orders
+		WHERE account_id=$1 AND status IN ('new','partially_filled')
+		ORDER BY id`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OrderRow
+	for rows.Next() {
+		var o OrderRow
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.Symbol, &o.Side, &o.OrderType,
+			&o.Price, &o.Quantity, &o.FilledQty, &o.Status, &o.BrokerOrderID,
+			&o.ClientOrderID, &o.StrategyID, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// orderStatusRankSQL 返回按状态只增不退的 CASE 表达式（col 是列名或参数占位符）。
+// filled(4) > canceled/rejected(3) > partially_filled(2) > new(1)。
+func orderStatusRankSQL(col string) string {
+	return `(CASE ` + col + ` WHEN 'filled' THEN 4 WHEN 'canceled' THEN 3 WHEN 'rejected' THEN 3 WHEN 'partially_filled' THEN 2 ELSE 1 END)`
+}
+
 // UpdateOrderFill 把状态和累计成交量一起写回，供 UDS executionReport 用。
+// H5：状态只增不退；filled_qty 只增不减，避免乱序回报把成交量打回去。
 func (s *Store) UpdateOrderFill(ctx context.Context, localID int64, status string, filledQty float64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE orders SET status=$1, filled_qty=$2 WHERE id=$3`, status, filledQty, localID)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE orders SET status=$1, filled_qty=GREATEST(COALESCE(filled_qty,0), $2) WHERE id=$3
+		AND `+orderStatusRankSQL("$1")+` >= `+orderStatusRankSQL("status"),
+		status, filledQty, localID)
 	return err
 }
 

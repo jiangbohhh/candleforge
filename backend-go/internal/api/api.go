@@ -7,9 +7,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,6 +39,8 @@ type Server struct {
 	risk    *risk.Engine
 	envInfo map[string]string
 	mgr     *strategy.Manager // M6 策略引擎（可为 nil，向后兼容）
+
+	backfillRunning atomic.Bool // M20：backfill single-flight
 
 	// 安全（WP2）
 	authToken   string   // 静态 API Token；空 → 鉴权关闭
@@ -313,11 +317,23 @@ func (s *Server) runBacktest(c *gin.Context) {
 	if body.Interval == "" {
 		body.Interval = "1h"
 	}
+	// D2/H7：limit 夹在 [1, 10000]，防超大 limit 打爆 PG/内存与 gRPC 载荷。
 	if body.Limit <= 0 {
 		body.Limit = 500
+	} else if body.Limit > 10000 {
+		body.Limit = 10000
+	}
+	// D3/H14：拒绝 NaN/Inf（会触发 protojson 失败/无限资金），commission 限 [0,1]。
+	if math.IsNaN(body.InitialCash) || math.IsInf(body.InitialCash, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "initialCash must be a finite number"})
+		return
 	}
 	if body.InitialCash <= 0 {
 		body.InitialCash = 10000
+	}
+	if math.IsNaN(body.Commission) || math.IsInf(body.Commission, 0) || body.Commission < 0 || body.Commission > 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "commission must be a finite number in [0,1]"})
+		return
 	}
 
 	ctx := c.Request.Context()
@@ -368,16 +384,27 @@ func (s *Server) runBacktest(c *gin.Context) {
 		}
 	}
 
-	// protojson 序列化各部分用于落库与返回
-	metricsJSON, _ := protoMarshaler.Marshal(resp.GetMetrics())
-	equityJSON := marshalList(len(resp.GetEquityCurve()), func(i int) any {
-		b, _ := protoMarshaler.Marshal(resp.GetEquityCurve()[i])
-		return json.RawMessage(b)
+	// protojson 序列化各部分用于落库与返回。
+	// D1/H6：序列化错误不再丢弃——失败即 500，避免落库/返回 null 导致前端白屏。
+	metricsJSON, err := protoMarshaler.Marshal(resp.GetMetrics())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "serialize metrics: " + err.Error()})
+		return
+	}
+	equityJSON, err := marshalList(len(resp.GetEquityCurve()), func(i int) (json.RawMessage, error) {
+		return protoMarshaler.Marshal(resp.GetEquityCurve()[i])
 	})
-	tradesJSON := marshalList(len(resp.GetTrades()), func(i int) any {
-		b, _ := protoMarshaler.Marshal(resp.GetTrades()[i])
-		return json.RawMessage(b)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "serialize equity curve: " + err.Error()})
+		return
+	}
+	tradesJSON, err := marshalList(len(resp.GetTrades()), func(i int) (json.RawMessage, error) {
+		return protoMarshaler.Marshal(resp.GetTrades()[i])
 	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "serialize trades: " + err.Error()})
+		return
+	}
 
 	id, err := s.store.InsertBacktestRun(ctx, store.BacktestRun{
 		Symbol: body.Symbol, Strategy: body.Strategy, Interval: body.Interval,
@@ -453,21 +480,31 @@ func (s *Server) getBacktestRun(c *gin.Context) {
 	c.JSON(http.StatusOK, run)
 }
 
-// marshalList 把 n 个元素拼成 JSON 数组的 RawMessage。
-func marshalList(n int, get func(i int) any) json.RawMessage {
-	items := make([]any, n)
+// marshalList 把 n 个元素逐个序列化后拼成 JSON 数组的 RawMessage。
+// D1/H6：任一元素序列化失败即返回 error（protojson 对 NaN/Inf 会失败），不再丢弃。
+func marshalList(n int, get func(i int) (json.RawMessage, error)) (json.RawMessage, error) {
+	items := make([]json.RawMessage, n)
 	for i := 0; i < n; i++ {
-		items[i] = get(i)
+		b, err := get(i)
+		if err != nil {
+			return nil, err
+		}
+		items[i] = b
 	}
-	b, _ := json.Marshal(items)
-	return b
+	return json.Marshal(items)
 }
 
 // ── 管理 ──
 
 func (s *Server) triggerBackfill(c *gin.Context) {
+	// M20：single-flight——已有回填在跑则拒绝重复触发，避免并发请求打爆 Binance 限频与 PG。
+	if !s.backfillRunning.CompareAndSwap(false, true) {
+		c.JSON(http.StatusConflict, gin.H{"error": "backfill already running"})
+		return
+	}
 	// 异步执行，避免请求阻塞
 	go func() {
+		defer s.backfillRunning.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		_ = market.Backfill(ctx, s.store, s.src)
@@ -672,7 +709,10 @@ func (s *Server) listPositions(c *gin.Context) {
 	}
 	for i := range positions {
 		positions[i].MarketPrice = s.priceLookup(positions[i].Symbol)
-		positions[i].Unrealized = (positions[i].MarketPrice - positions[i].AvgPrice) * positions[i].Quantity
+		// B1：成本未知（AvgPriceValid=false）则浮盈置 0。
+		if positions[i].AvgPriceValid {
+			positions[i].Unrealized = (positions[i].MarketPrice - positions[i].AvgPrice) * positions[i].Quantity
+		}
 	}
 	c.JSON(http.StatusOK, positions)
 }

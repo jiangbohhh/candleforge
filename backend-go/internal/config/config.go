@@ -30,6 +30,10 @@ type Config struct {
 	// M6 策略引擎
 	MaxRunningStrategies int // 并行策略上限；默认 5
 
+	// 风控 / 撮合（E2/E3）
+	RiskMaxNotional float64 // 单笔名义额上限 USDT；<=0 不设上限
+	SimCommission   float64 // 模拟盘手续费率；默认 0.001
+
 	// 安全（WP2）
 	AuthToken        string   // 静态 API Token；空 → 鉴权关闭（仅本地开发）
 	CORSOrigins      []string // CORS 白名单；空 → 反射任意来源（仅本地开发）
@@ -53,6 +57,9 @@ func Load() *Config {
 		BinanceFuturesAPISecret: os.Getenv("BINANCE_FUTURES_API_SECRET"),
 
 		MaxRunningStrategies: getint("MAX_RUNNING_STRATEGIES", 5),
+
+		RiskMaxNotional: getfloat("RISK_MAX_NOTIONAL", 50000),
+		SimCommission:   getfloat("SIM_COMMISSION", 0.001),
 
 		AuthToken:        os.Getenv("AUTH_TOKEN"),
 		CORSOrigins:      getlist("CORS_ORIGINS"),
@@ -114,6 +121,19 @@ func getint(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// getfloat 读取浮点环境变量；空/非法/负数回落默认值。
+func getfloat(key string, fallback float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return fallback
+	}
+	return f
 }
 
 func defaultDatabaseURL() string {

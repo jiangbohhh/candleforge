@@ -138,18 +138,23 @@
 
 ---
 
-## 4. 数据库设计（核心表）
+## 4. 数据库设计（当前已落库）
 
-- [ ] `users` 用户表
-- [ ] `symbols` 标的元数据（代码、名称、市场、类型）
-- [ ] `kline_*` K 线时序表（按周期分表/分区）
-- [ ] `accounts` 账户（模拟/实盘，资金、可用余额）
-- [ ] `positions` 持仓（标的、数量、均价、浮动盈亏）
-- [ ] `orders` 订单（委托、状态、成交明细）
-- [ ] `trades` 成交流水
-- [ ] `strategies` 策略配置（参数、状态、绑定账户）
-- [ ] `backtest_runs` 回测记录（参数、绩效指标、净值曲线）
-- [ ] `watchlist` 自选列表
+> 当前有效结构为 `0001`～`0006` 迁移叠加后的 **12 张业务表**。完整合并 DDL，以及逐表字段、默认值、NULL、备注、外键、删除动作、索引和 JSONB 载荷见 [`docs/DATABASE_SCHEMA.md`](docs/DATABASE_SCHEMA.md)。
+
+- [ ] `users`：单用户认证（M7 待做）
+- [x] `symbols`：标的元数据与统一/原生符号映射
+- [x] `klines`：单表多周期 K 线，复合主键去重
+- [x] `funding_rates`：USDT-M 永续历史资金费率
+- [x] `watchlist`：当前单用户全局自选列表
+- [x] `accounts`：模拟/实盘/子账户与父子关系
+- [x] `account_transfers`：账户间资金划转台账
+- [x] `positions`：账户-标的聚合持仓
+- [x] `orders`：统一订单及交易所订单号、策略归属
+- [x] `trades`：逐笔成交流水
+- [x] `strategies`：策略配置、账户绑定与运行快照
+- [x] `strategy_orders`：网格 intent log 与订单映射
+- [x] `backtest_runs`：回测参数、指标、净值曲线与成交明细
 
 ---
 

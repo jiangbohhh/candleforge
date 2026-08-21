@@ -67,6 +67,10 @@ type BinanceFuturesBroker struct {
 
 	levMu  sync.Mutex      // 保护 levSet
 	levSet map[string]bool // 已确认设为 1x 杠杆的 native symbol
+
+	reconcileMu sync.Mutex
+	pollStop    chan struct{}
+	pollOnce    sync.Once
 }
 
 // NewBinanceFuturesBroker 构造 broker：设单向持仓模式 → 同步余额/持仓 → 启动 UDS。
@@ -85,15 +89,22 @@ func NewBinanceFuturesBroker(ctx context.Context, st *store.Store, hub *ws.Hub, 
 	if err := b.SyncBalances(ctx); err != nil {
 		return nil, fmt.Errorf("initial futures balance sync: %w", err)
 	}
+	b.pollStop = make(chan struct{})
 	b.uds = startFuturesUserDataStream(b)
+	go pollOpenOrders(b.pollStop, b.ReconcileOrders, "binance futures")
 	return b, nil
 }
 
-// Stop 关闭 UDS 循环。
+// Stop 关闭 UDS 循环与订单对账轮询。
 func (b *BinanceFuturesBroker) Stop() {
 	if b.uds != nil {
 		b.uds.stop()
 	}
+	b.pollOnce.Do(func() {
+		if b.pollStop != nil {
+			close(b.pollStop)
+		}
+	})
 }
 
 // SyncBalances 拉一次合约账户：USDT 可用余额 → accounts.cash；
@@ -264,6 +275,57 @@ func (b *BinanceFuturesBroker) ListOrders(ctx context.Context, accountID int64) 
 
 func (b *BinanceFuturesBroker) GetPositions(ctx context.Context, accountID int64) ([]store.PositionView, error) {
 	return b.store.ListPositions(ctx, accountID)
+}
+
+// ReconcileOrders 用 fapi REST 对齐本地未终态订单（同现货语义）。
+func (b *BinanceFuturesBroker) ReconcileOrders(ctx context.Context) error {
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+
+	local, err := b.store.ListOpenOrders(ctx, b.accountID)
+	if err != nil {
+		return err
+	}
+	if len(local) == 0 {
+		return nil
+	}
+
+	open, err := b.client.NewListOpenOrdersService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("list open orders: %w", err)
+	}
+	byCoid := make(map[string]*futures.Order, len(open))
+	for _, eo := range open {
+		if eo != nil && eo.ClientOrderID != "" {
+			byCoid[eo.ClientOrderID] = eo
+		}
+	}
+
+	for i := range local {
+		o := &local[i]
+		if o.ClientOrderID == "" {
+			continue
+		}
+		if eo, ok := byCoid[o.ClientOrderID]; ok {
+			st := mapBinanceStatusString(string(eo.Status))
+			if !venueFillUnchanged(o, st, eo.ExecutedQuantity) {
+				b.adoptOrder(ctx, o.ID, eo.OrderID, st, eo.ExecutedQuantity)
+			}
+			continue
+		}
+		native, nerr := market.ToNative(o.Symbol)
+		if nerr != nil {
+			continue
+		}
+		got, qerr := b.client.NewGetOrderService().Symbol(native).OrigClientOrderID(o.ClientOrderID).Do(ctx)
+		if qerr != nil || got == nil {
+			log.Printf("binance futures: reconcile order %d coid=%s query: %v", o.ID, o.ClientOrderID, qerr)
+			continue
+		}
+		b.adoptOrder(ctx, o.ID, got.OrderID, mapBinanceStatusString(string(got.Status)), got.ExecutedQuantity)
+		log.Printf("binance futures: adopted order %d status=%s filled=%s (missed UDS)", o.ID, got.Status, got.ExecutedQuantity)
+	}
+	return nil
 }
 
 // ── 内部 helper ──

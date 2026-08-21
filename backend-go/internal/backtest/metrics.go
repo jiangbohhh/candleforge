@@ -26,13 +26,16 @@ func Metrics(equityCurve []EquityPoint, initialCash float64, tradeCount, winCoun
 	final := equityCurve[len(equityCurve)-1].Value
 	totalReturn := (final - initialCash) / initialCash
 
-	// 年化收益（对齐 backtrader Returns.rnorm: compound annualized）
+	// 年化收益（对齐 backtrader Returns.rnorm: compound annualized）。
+	// D3/H14：窗口过短（<0.1 年）时复合年化会把小波动放大成天文数字，退化为线性年化。
 	firstTime := time.UnixMilli(equityCurve[0].Time)
 	lastTime := time.UnixMilli(equityCurve[len(equityCurve)-1].Time)
 	years := lastTime.Sub(firstTime).Hours() / 24 / 365.25
 	var annualReturn float64
-	if years > 0 && final > 0 {
+	if years >= 0.1 && final > 0 {
 		annualReturn = math.Pow(final/initialCash, 1/years) - 1
+	} else if years > 0 && initialCash > 0 {
+		annualReturn = (final - initialCash) / initialCash * (365.25 * 24 * 3600) / (lastTime.Sub(firstTime).Seconds())
 	}
 
 	// 最大回撤（小数，对齐 runner.py 已 ÷100）

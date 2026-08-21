@@ -1,8 +1,13 @@
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080'
+// 鉴权 token（与后端 AUTH_TOKEN 同值）；留空 = 不鉴权（本地开发）。
+const AUTH_TOKEN = import.meta.env.VITE_AUTH_TOKEN ?? ''
 
-export const http = axios.create({ baseURL: API_BASE })
+export const http = axios.create({
+  baseURL: API_BASE,
+  headers: AUTH_TOKEN ? { 'X-Auth-Token': AUTH_TOKEN } : {},
+})
 
 // ── 类型 ──
 export interface Symbol {
@@ -136,7 +141,7 @@ export interface BrokerInfo {
 
 export type OrderSide = 'buy' | 'sell'
 export type OrderType = 'market' | 'limit'
-export type OrderStatus = 'new' | 'filled' | 'canceled' | 'rejected'
+export type OrderStatus = 'new' | 'partially_filled' | 'filled' | 'canceled' | 'rejected'
 
 export interface Order {
   id: number
@@ -261,7 +266,11 @@ export function connectWS(handlers: WSHandlers): () => void {
   let closed = false
 
   const connect = () => {
-    ws = new WebSocket(`${wsBase}/ws`)
+    // 配了 token 则用查询参数鉴权（浏览器无法自定义 WS 握手头）。
+    const wsURL = AUTH_TOKEN
+      ? `${wsBase}/ws?token=${encodeURIComponent(AUTH_TOKEN)}`
+      : `${wsBase}/ws`
+    ws = new WebSocket(wsURL)
     ws.onmessage = (ev) => {
       try {
         const msg: { type: string; data: unknown } = JSON.parse(ev.data)

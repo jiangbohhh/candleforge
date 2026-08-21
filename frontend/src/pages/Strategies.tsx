@@ -114,7 +114,11 @@ export default function Strategies({ onNav }: Props) {
   useEffect(() => {
     const wsBase = (import.meta.env.VITE_API_BASE ?? 'http://localhost:8080')
       .replace(/^http/, 'ws')
-    const sock = new WebSocket(`${wsBase}/ws`)
+    const token = import.meta.env.VITE_AUTH_TOKEN ?? ''
+    const wsURL = token
+      ? `${wsBase}/ws?token=${encodeURIComponent(token)}`
+      : `${wsBase}/ws`
+    const sock = new WebSocket(wsURL)
     sock.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data)
@@ -266,7 +270,6 @@ export default function Strategies({ onNav }: Props) {
               type="primary"
               icon={<PlayCircleOutlined />}
               onClick={() => handleStart(r.id)}
-              disabled={r.status === 'running'}
             >
               启动
             </Button>

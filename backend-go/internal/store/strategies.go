@@ -227,10 +227,15 @@ func (s *Store) RegisterRealSubAccount(ctx context.Context, parentID int64, name
 		return nil, fmt.Errorf("encrypt api_secret: %w", err)
 	}
 	var id int64
+	// F2/M2：重名子账户改为 upsert（更新凭证与邮箱），不再因 ON CONFLICT DO NOTHING
+	// 无行返回而报 500。加密后的凭证在冲突时同样被覆盖。
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO accounts (name, kind, broker, cash, parent_id, sub_email, api_key, api_secret)
 		VALUES ($1,'sub','binance',0,$2,$3,$4,$5)
-		ON CONFLICT (name) DO NOTHING
+		ON CONFLICT (name) DO UPDATE SET
+			sub_email = EXCLUDED.sub_email,
+			api_key = EXCLUDED.api_key,
+			api_secret = EXCLUDED.api_secret
 		RETURNING id`,
 		name, parentID, subEmail, encKey, encSecret).Scan(&id)
 	if err != nil {
@@ -334,22 +339,38 @@ func (s *Store) TransferFunds(ctx context.Context, fromID, toID int64, amount fl
 // ── strategy_orders intent-log ──
 
 type StrategyOrderRow struct {
-	ID         int64     `json:"id"`
-	StrategyID int64     `json:"strategyId"`
-	GridLevel  int       `json:"gridLevel"`
-	Side       string    `json:"side"`
-	Price      float64   `json:"price"`
-	OrderID    int64     `json:"orderId"` // 0 = intent 未落单
-	Purpose    string    `json:"purpose"`
-	Active     bool      `json:"active"`
-	Processed  bool      `json:"processed"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ID          int64     `json:"id"`
+	StrategyID  int64     `json:"strategyId"`
+	GridLevel   int       `json:"gridLevel"`
+	Side        string    `json:"side"`
+	Price       float64   `json:"price"`
+	OrderID     int64     `json:"orderId"` // 0 = intent 未落单
+	Purpose     string    `json:"purpose"`
+	Active      bool      `json:"active"`
+	Processed   bool      `json:"processed"`
+	Qty         float64   `json:"qty"`
+	ConsumedQty float64   `json:"consumedQty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+const strategyOrderCols = `
+		so.id, so.strategy_id, so.grid_level, so.side, so.price::float8,
+		COALESCE(so.order_id,0), so.purpose, so.active, so.processed,
+		so.created_at, so.updated_at,
+		COALESCE(so.qty,0)::float8, COALESCE(so.consumed_qty,0)::float8`
+
+func scanStrategyOrder(scan func(dest ...any) error) (StrategyOrderRow, error) {
+	var r StrategyOrderRow
+	err := scan(&r.ID, &r.StrategyID, &r.GridLevel, &r.Side, &r.Price,
+		&r.OrderID, &r.Purpose, &r.Active, &r.Processed,
+		&r.CreatedAt, &r.UpdatedAt, &r.Qty, &r.ConsumedQty)
+	return r, err
 }
 
 // InsertIntent 写入一条 intent（步骤①），同时将该 gridLevel 旧活动 intent 设为 inactive。
-// 在事务中执行保证原子性。
-func (s *Store) InsertIntent(ctx context.Context, strategyID int64, level int, side string, price float64, purpose string) (int64, error) {
+// qty 是该 intent 应对应的下单数量（部成后重挂剩余量时小于 QtyPerGrid）。
+func (s *Store) InsertIntent(ctx context.Context, strategyID int64, level int, side string, price, qty float64, purpose string) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -365,9 +386,9 @@ func (s *Store) InsertIntent(ctx context.Context, strategyID int64, level int, s
 
 	var id int64
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO strategy_orders (strategy_id, grid_level, side, price, purpose, active)
-		VALUES ($1,$2,$3,$4,$5,true)
-		RETURNING id`, strategyID, level, side, price, purpose).Scan(&id)
+		INSERT INTO strategy_orders (strategy_id, grid_level, side, price, qty, purpose, active)
+		VALUES ($1,$2,$3,$4,$5,$6,true)
+		RETURNING id`, strategyID, level, side, price, qty, purpose).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -398,6 +419,71 @@ func (s *Store) ClaimIntentProcessed(ctx context.Context, intentID int64) (bool,
 	return n == 1, nil
 }
 
+// ClaimIntentAndSaveState 在单个事务里原子地完成：
+//  1. 把 intent 从未消费迁移到已消费（认领，processed false→true），并推进 consumed_qty；
+//  2. 若 state 非空，写入策略快照（strategies.state）。state 为空则只认领、不改引擎状态
+//     （部成后撤单重挂剩余量）。
+//
+// 返回 true 表示本次赢得了认领；false 表示该 intent 已被消费（调用方必须跳过补单）。
+func (s *Store) ClaimIntentAndSaveState(ctx context.Context, intentID, strategyID int64, consumed float64, state json.RawMessage) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE strategy_orders
+		   SET processed=true,
+		       consumed_qty=GREATEST(consumed_qty, $2),
+		       updated_at=now()
+		 WHERE id=$1 AND processed=false`, intentID, consumed)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil // 已被消费
+	}
+	if len(state) > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE strategies SET state=$1, updated_at=now() WHERE id=$2`, nullableJSON(state), strategyID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// TouchIntentConsumed 只推进 consumed_qty（部分成交、intent 仍活动）。只增不减。
+func (s *Store) TouchIntentConsumed(ctx context.Context, intentID int64, consumed float64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE strategy_orders SET consumed_qty=GREATEST(consumed_qty,$1), updated_at=now()
+		 WHERE id=$2 AND processed=false`, consumed, intentID)
+	return err
+}
+
+// GetIntentByOrderID 按本地订单号找最近一条 intent；没有则 (nil, nil)。
+func (s *Store) GetIntentByOrderID(ctx context.Context, strategyID, orderID int64) (*StrategyOrderRow, error) {
+	r, err := scanStrategyOrder(s.db.QueryRowContext(ctx, `
+		SELECT`+strategyOrderCols+`
+		FROM strategy_orders so
+		WHERE so.strategy_id=$1 AND so.order_id=$2
+		ORDER BY so.id DESC LIMIT 1`, strategyID, orderID).Scan)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // DeactivateAllIntents 停止策略时将全部活动 intent 置为 inactive。
 func (s *Store) DeactivateAllIntents(ctx context.Context, strategyID int64) error {
 	_, err := s.db.ExecContext(ctx,
@@ -406,12 +492,34 @@ func (s *Store) DeactivateAllIntents(ctx context.Context, strategyID int64) erro
 	return err
 }
 
-// ListActiveIntents 列出某策略所有活动 intent，join orders 取最新状态。
+// DeactivateIntent 把单条 intent 置为 inactive（下单失败回滚用，C1）。
+// 目的是避免「active 但 order_id=0 的悬空 intent」被部分唯一索引长期挡住该层重试。
+func (s *Store) DeactivateIntent(ctx context.Context, intentID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE strategy_orders SET active=false, updated_at=now() WHERE id=$1`, intentID)
+	return err
+}
+
+// ListDanglingIntents 列出「active 但尚未落单」的 intent（order_id 为空/0），
+// 即网格补单失败留下的空洞，供 Reconcile 重试补挂（C1）。
+func (s *Store) ListDanglingIntents(ctx context.Context, strategyID int64) ([]StrategyOrderRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT`+strategyOrderCols+`
+		FROM strategy_orders so
+		WHERE so.strategy_id=$1 AND so.active=true
+		  AND so.purpose='grid' AND (so.order_id IS NULL OR so.order_id=0)
+		ORDER BY so.grid_level`, strategyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectStrategyOrders(rows)
+}
+
+// ListActiveIntents 列出某策略所有活动 intent。
 func (s *Store) ListActiveIntents(ctx context.Context, strategyID int64) ([]StrategyOrderRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT so.id, so.strategy_id, so.grid_level, so.side, so.price::float8,
-		       COALESCE(so.order_id,0), so.purpose, so.active, so.processed,
-		       so.created_at, so.updated_at
+		SELECT`+strategyOrderCols+`
 		FROM strategy_orders so
 		WHERE so.strategy_id=$1 AND so.active=true
 		ORDER BY so.grid_level`, strategyID)
@@ -419,39 +527,33 @@ func (s *Store) ListActiveIntents(ctx context.Context, strategyID int64) ([]Stra
 		return nil, err
 	}
 	defer rows.Close()
-	var out []StrategyOrderRow
-	for rows.Next() {
-		var r StrategyOrderRow
-		if err := rows.Scan(&r.ID, &r.StrategyID, &r.GridLevel, &r.Side, &r.Price,
-			&r.OrderID, &r.Purpose, &r.Active, &r.Processed,
-			&r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return collectStrategyOrders(rows)
 }
 
-// ListUnprocessedIntents 取未消费的已成交 intent（order filled 且 !processed）。
+// ListUnprocessedIntents 取尚未完全消化的 intent：全成/撤/拒，或部成且成交量超过已消费量。
 func (s *Store) ListUnprocessedIntents(ctx context.Context, strategyID int64) ([]StrategyOrderRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT so.id, so.strategy_id, so.grid_level, so.side, so.price::float8,
-		       COALESCE(so.order_id,0), so.purpose, so.active, so.processed,
-		       so.created_at, so.updated_at
+		SELECT`+strategyOrderCols+`
 		FROM strategy_orders so
 		JOIN orders o ON o.id = so.order_id
-		WHERE so.strategy_id=$1 AND so.processed=false AND o.status='filled'
+		WHERE so.strategy_id=$1 AND so.processed=false
+		  AND (
+		        o.status IN ('filled','canceled','rejected')
+		     OR (o.status='partially_filled' AND so.consumed_qty < o.filled_qty)
+		  )
 		ORDER BY so.grid_level`, strategyID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return collectStrategyOrders(rows)
+}
+
+func collectStrategyOrders(rows *sql.Rows) ([]StrategyOrderRow, error) {
 	var out []StrategyOrderRow
 	for rows.Next() {
-		var r StrategyOrderRow
-		if err := rows.Scan(&r.ID, &r.StrategyID, &r.GridLevel, &r.Side, &r.Price,
-			&r.OrderID, &r.Purpose, &r.Active, &r.Processed,
-			&r.CreatedAt, &r.UpdatedAt); err != nil {
+		r, err := scanStrategyOrder(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -466,7 +568,7 @@ func (s *Store) ListOrphanStrategyOrders(ctx context.Context, strategyID int64) 
 		       COALESCE(o.price,0), o.quantity, COALESCE(o.filled_qty,0),
 		       o.status, COALESCE(o.broker_order_id,''), COALESCE(o.strategy_id,0), o.created_at
 		FROM orders o
-		WHERE o.strategy_id=$1 AND o.status='new'
+		WHERE o.strategy_id=$1 AND o.status IN ('new','partially_filled')
 		  AND NOT EXISTS (
 		      SELECT 1 FROM strategy_orders so
 		      WHERE so.order_id=o.id AND so.active=true

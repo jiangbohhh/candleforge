@@ -96,6 +96,7 @@ func (u *futuresUserDataStream) dialAndListen() error {
 	}()
 
 	log.Printf("binance futures UDS: connected %s", u.broker.opts.wsBase())
+	go reconcileAfterConnect(u.broker.ReconcileOrders, "binance futures")
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {

@@ -58,6 +58,13 @@ services:
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       HTTP_PROXY: ${HTTP_PROXY:-}
       NO_PROXY: ${NO_PROXY:-postgres,quant-py,redis,localhost,127.0.0.1}
+      # 安全（WP2）：未透传则容器内鉴权静默关闭、凭证明文落库。
+      AUTH_TOKEN: ${AUTH_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      CREDENTIAL_ENC_KEY: ${CREDENTIAL_ENC_KEY:-}
+      # 风控/撮合可配置上限（E2/E3）。
+      RISK_MAX_NOTIONAL: ${RISK_MAX_NOTIONAL:-50000}
+      SIM_COMMISSION: ${SIM_COMMISSION:-0.001}
     ports:
       - "8080:8080"
     depends_on:

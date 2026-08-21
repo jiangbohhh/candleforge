@@ -2,7 +2,9 @@
 package events
 
 import (
+	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jiangbohhh/candleforge/backend-go/internal/store"
 )
@@ -14,6 +16,7 @@ const defaultBufSize = 512
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[int64][]chan *store.OrderRow // key = strategyID; 0 = 全局
+	dropped     atomic.Int64                     // 缓冲满被丢弃的事件数（F4 可观测性）
 }
 
 func NewBus() *Bus {
@@ -57,6 +60,12 @@ func (b *Bus) PublishOrder(o *store.OrderRow) {
 		select {
 		case ch <- o:
 		default:
+			// F4：满丢弃时计数并打日志，把「成交事件静默丢失」变成可观测。
+			// 丢失的成交由策略 Reconcile（ListUnprocessedIntents）兜底收养，不会永久漂移。
+			n := b.dropped.Add(1)
+			if n%100 == 1 {
+				log.Printf("events bus: dropped %d order events (subscriber buffer full)", n)
+			}
 		}
 	}
 }

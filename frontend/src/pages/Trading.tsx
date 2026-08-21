@@ -224,11 +224,12 @@ export default function Trading({ onNav }: Props) {
   const statusTag = (s: Order['status']) => {
     const map: Record<Order['status'], { color: string; text: string }> = {
       new: { color: 'blue', text: '挂单' },
+      partially_filled: { color: 'gold', text: '部分成交' },
       filled: { color: 'green', text: '已成交' },
       canceled: { color: 'default', text: '已撤销' },
       rejected: { color: 'red', text: '已拒绝' },
     }
-    const m = map[s]
+    const m = map[s] ?? { color: 'default', text: s }
     return <Tag color={m.color}>{m.text}</Tag>
   }
 
@@ -507,7 +508,7 @@ export default function Trading({ onNav }: Props) {
                   {
                     title: '',
                     render: (_, r: Order) =>
-                      r.status === 'new' ? (
+                      r.status === 'new' || r.status === 'partially_filled' ? (
                         <a onClick={() => cancelOrder(r.id)}>撤单</a>
                       ) : null,
                   },

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 
 	binance "github.com/adshao/go-binance/v2"
 
@@ -75,6 +76,10 @@ type BinanceBroker struct {
 	accountID int64
 	opts      BinanceOptions
 	uds       *userDataStream
+
+	reconcileMu sync.Mutex
+	pollStop    chan struct{}
+	pollOnce    sync.Once
 }
 
 // NewBinanceBroker 构造 broker，同步初始余额，启动 User Data Stream。
@@ -87,15 +92,22 @@ func NewBinanceBroker(ctx context.Context, st *store.Store, hub *ws.Hub, bus *ev
 	if err := b.SyncBalances(ctx); err != nil {
 		return nil, fmt.Errorf("initial balance sync: %w", err)
 	}
+	b.pollStop = make(chan struct{})
 	b.uds = startUserDataStream(b)
+	go pollOpenOrders(b.pollStop, b.ReconcileOrders, "binance")
 	return b, nil
 }
 
-// Stop 关闭 UDS 循环。
+// Stop 关闭 UDS 循环与订单对账轮询。
 func (b *BinanceBroker) Stop() {
 	if b.uds != nil {
 		b.uds.stop()
 	}
+	b.pollOnce.Do(func() {
+		if b.pollStop != nil {
+			close(b.pollStop)
+		}
+	})
 }
 
 // SyncBalances 拉一次 Binance 账户余额覆盖本地 cash + positions。
@@ -235,6 +247,58 @@ func (b *BinanceBroker) GetPositions(ctx context.Context, accountID int64) ([]st
 	return b.store.ListPositions(ctx, accountID)
 }
 
+// ReconcileOrders 用 REST 对齐本地未终态订单：仍在交易所则回写成交量，
+// 不在挂单簿则按 clientOrderId 查终态收养（停机窗口 / UDS 丢包）。
+func (b *BinanceBroker) ReconcileOrders(ctx context.Context) error {
+	b.reconcileMu.Lock()
+	defer b.reconcileMu.Unlock()
+
+	local, err := b.store.ListOpenOrders(ctx, b.accountID)
+	if err != nil {
+		return err
+	}
+	if len(local) == 0 {
+		return nil
+	}
+
+	open, err := b.client.NewListOpenOrdersService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("list open orders: %w", err)
+	}
+	byCoid := make(map[string]*binance.Order, len(open))
+	for _, eo := range open {
+		if eo != nil && eo.ClientOrderID != "" {
+			byCoid[eo.ClientOrderID] = eo
+		}
+	}
+
+	for i := range local {
+		o := &local[i]
+		if o.ClientOrderID == "" {
+			continue
+		}
+		if eo, ok := byCoid[o.ClientOrderID]; ok {
+			st := mapBinanceStatus(eo.Status)
+			if !venueFillUnchanged(o, st, eo.ExecutedQuantity) {
+				b.adoptOrder(ctx, o.ID, eo.OrderID, st, eo.ExecutedQuantity)
+			}
+			continue
+		}
+		native, nerr := market.ToNative(o.Symbol)
+		if nerr != nil {
+			continue
+		}
+		got, qerr := b.client.NewGetOrderService().Symbol(native).OrigClientOrderID(o.ClientOrderID).Do(ctx)
+		if qerr != nil || got == nil {
+			log.Printf("binance: reconcile order %d coid=%s query: %v", o.ID, o.ClientOrderID, qerr)
+			continue
+		}
+		b.adoptOrder(ctx, o.ID, got.OrderID, mapBinanceStatus(got.Status), got.ExecutedQuantity)
+		log.Printf("binance: adopted order %d status=%s filled=%s (missed UDS)", o.ID, got.Status, got.ExecutedQuantity)
+	}
+	return nil
+}
+
 // ── 内部 helper ──
 
 func (b *BinanceBroker) broadcastOrder(localID int64) {
@@ -252,16 +316,5 @@ func (b *BinanceBroker) broadcastOrder(localID int64) {
 }
 
 func mapBinanceStatus(s binance.OrderStatusType) string {
-	switch s {
-	case binance.OrderStatusTypeNew, binance.OrderStatusTypePartiallyFilled:
-		return "new"
-	case binance.OrderStatusTypeFilled:
-		return "filled"
-	case binance.OrderStatusTypeCanceled, binance.OrderStatusTypePendingCancel, binance.OrderStatusTypeExpired:
-		return "canceled"
-	case binance.OrderStatusTypeRejected:
-		return "rejected"
-	default:
-		return "new"
-	}
+	return mapBinanceStatusString(string(s))
 }

@@ -135,6 +135,7 @@ func (u *userDataStream) dispatch(raw []byte, subscribeReqID string) {
 			return
 		}
 		log.Printf("binance UDS: subscribe ack %s", string(generic.Result))
+		go reconcileAfterConnect(u.broker.ReconcileOrders, "binance")
 		return
 	}
 
@@ -247,8 +248,8 @@ func (u *userDataStream) handleAccountUpdate(msg []byte) {
 
 func mapBinanceStatusString(s string) string {
 	switch s {
-	case "NEW", "PARTIALLY_FILLED":
-		return "new"
+	case "PARTIALLY_FILLED":
+		return "partially_filled"
 	case "FILLED":
 		return "filled"
 	case "CANCELED", "PENDING_CANCEL", "EXPIRED":

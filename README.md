@@ -45,7 +45,7 @@
                                       │  Python 回测服务（backtrader）│
                                       └─────────────────────────────┘
                               ┌────────────────────────────────────┐
-                              │   PostgreSQL（业务数据）+ Redis     │
+                              │   PostgreSQL（业务数据 + K 线）      │
                               └────────────────────────────────────┘
 ```
 
@@ -55,11 +55,11 @@
 
 | 层 | 技术 |
 |------|------|
-| 后端主服务 | Go 1.23 · Gin · gorilla/websocket · [go-binance](https://github.com/adshao/go-binance) · GORM/sqlc · gRPC |
-| 回测服务 | Python 3.12 · backtrader · pandas/numpy · grpcio |
-| 前端 | React · TypeScript · Vite · Ant Design · TradingView Lightweight Charts |
-| 数据库 | PostgreSQL · Redis |
-| 部署 | Docker · docker-compose · Kubernetes · Helm |
+| 后端主服务 | Go 1.23 · Gin · gorilla/websocket · [go-binance/v2](https://github.com/adshao/go-binance) · pgx · gRPC |
+| 回测服务 | Python 3.12 · backtrader · pandas/numpy（numpy 锁 <2.0）· grpcio |
+| 前端 | React · TypeScript · Vite · Ant Design · lightweight-charts |
+| 数据库 | PostgreSQL |
+| 部署 | Docker · docker-compose |
 
 ## 📦 项目结构
 
@@ -69,9 +69,13 @@ candleforge/
 ├── backend-go/     # Go 主服务（数据采集/交易/Web/账户/风控）
 ├── quant-py/       # Python 回测服务（backtrader）
 ├── frontend/       # React + TypeScript
-├── deploy/         # Helm chart + K8s 配置
+├── docs/
+│   ├── PROJECT_MANUAL.md    # 当前实现总览（本文档整理产物）
+│   ├── SECURITY_AUDIT.md    # 漏洞与优化点分析
+│   ├── DATABASE_SCHEMA.md   # 当前完整数据库模型与定义 SQL
+│   └── DESIGN.md            # 通用架构设计参考（应然）
 ├── docker-compose.yml
-└── PLAN.md         # 总体计划与设计文档
+└── PLAN.md         # 总体计划与里程碑
 ```
 
 ## 🗺️ 路线图
@@ -82,15 +86,17 @@ candleforge/
 | **M1** 数据+行情 | Binance 采数、落库、行情看板、自选 | ✅ |
 | **M2** 回测 | backtrader 回测、示例策略、绩效报告 | ✅ |
 | **M3** 模拟盘 | 撮合引擎、风控、模拟下单、持仓跟踪 | ✅ |
-| **M4** 实盘 | Binance 现货全自动、密钥安全、告警 | ✅ |
-| **未来** | A 股接入、合约/杠杆、多交易所 | 💡 |
+| **M4** 实盘 | Binance 现货全自动、testnet 默认/mainnet 双确认 | ✅ |
+| **M6** 策略引擎+现货网格 | 事件总线、策略注册/管理器、网格状态机、Go 网格回测、子账户 | ✅ |
+| **M6.5** 永续合约网格 | 三方向 1x 网格、资金费率回放、强平判定、BinanceFuturesBroker | ✅ |
+| **M7/M8/M9** | 单用户认证 / 做市策略 / Tailwind+shadcn 前端重构 | ⏳ |
 
-> 完整设计与决策记录见 [PLAN.md](PLAN.md)。
+> 完整设计与决策记录见 [PLAN.md](PLAN.md)；**当前实现总览**见 [docs/PROJECT_MANUAL.md](docs/PROJECT_MANUAL.md)；**漏洞与优化点**见 [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)；**架构评估（对标业界）**见 [docs/ARCHITECTURE_REVIEW.md](docs/ARCHITECTURE_REVIEW.md)；逐表数据库定义见 [docs/DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md)。
 
 ## 🚀 快速开始
 
-> ✅ 已落地：**M0 / M1 / M2 / M3 / M4**。当前可用 — 行情看板、策略回测、模拟盘交易、Binance 实盘交易（testnet 默认 / mainnet 二次确认）。
-> 🚧 下一步：策略管理、多账户、告警通知。
+> ✅ 已落地：**M0–M4、M6、M6.5**。当前可用 — 行情看板、策略回测（Go 网格 + Python 双均线）、模拟盘、Binance 现货/永续实盘（testnet 默认 / mainnet 二次确认）、网格策略引擎（现货 + 永续三方向）。
+> 🚧 下一步：M7 单用户认证、M8 做市策略、M9 前端重构。
 
 ### 方式一：Docker Compose（推荐）
 
