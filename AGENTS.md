@@ -98,3 +98,11 @@ Frontend `POST /api/backtest` → `api.runBacktest` reads klines from PG → con
 - `backend-go/internal/broker/sim.go` — Broker interface definition.
 - `backend-go/internal/store/migrations/` — single source of truth for DDL.
 - `quant-py/server.py` + `quant-py/backtest/runner.py` — backtest entry points.
+
+## Cursor Cloud specific instructions
+
+The Cloud Agent environment is repo-managed via `.cursor/environment.json` (no Docker; each service runs natively). `install` (`.cursor/install.sh`) adds Go 1.23 + PostgreSQL + a python venv and refreshes deps; `start` (`.cursor/start.sh`) boots Postgres and ensures the `candleforge` role/db; the three services run as `terminals` (quant-py `:50051`, backend-go `:8080`, frontend `:5173`).
+
+- **Local run layout**: Go 1.23 at `/usr/local/bin/go`; backtest worker venv at `quant-py/.venv` (run `./.venv/bin/python server.py`); PostgreSQL as `candleforge`/`candleforge` on `localhost:5432`. The backend reads `DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME` + `QUANT_ADDR` (see the `backend-go` terminal for the exact env).
+- **Binance is geo-blocked from the Cloud VM** (HTTP 451). So `SeedAndBackfill`, the live ticker WebSocket, funding-rate sync, and Binance live/futures trading (M4/M6.5) do **not** work here without an `HTTPS_PROXY`. These failures are non-fatal — the backend still boots and serves the API. The noisy `ws ... dial failed` reconnect loop in the `backend-go` terminal is expected.
+- **Empty market data by default**: because backfill is blocked, the `klines` table starts empty, so the market chart is blank and `POST /api/backtest` returns `no klines for symbol/interval`. To exercise the market board and both backtest engines offline, seed synthetic klines directly into Postgres (`INSERT INTO klines (...)`), then hit `/api/backtest` (grid → Go engine, dual_ma → Python/gRPC). Sim order fills also need a live price (`priceFn`), which comes only from the blocked ticker feed, so sim/live order fills require a working `HTTPS_PROXY`.
