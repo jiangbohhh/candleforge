@@ -1,0 +1,27 @@
+{
+  "name": "CandleForge",
+  "install": "bash .cursor/install.sh",
+  "start": "bash .cursor/start.sh",
+  "terminals": [
+    {
+      "name": "quant-py",
+      "description": "Python backtest worker (gRPC on :50051).",
+      "command": "cd quant-py && GRPC_ADDR=\"[::]:50051\" ./.venv/bin/python server.py"
+    },
+    {
+      "name": "backend-go",
+      "description": "Go main service / Web API (HTTP on :8080). Dials Postgres on localhost and quant-py lazily.",
+      "command": "cd backend-go && DB_HOST=localhost DB_PORT=5432 DB_USER=candleforge DB_PASSWORD=candleforge DB_NAME=candleforge QUANT_ADDR=localhost:50051 HTTP_ADDR=:8080 go run ./cmd/server"
+    },
+    {
+      "name": "frontend",
+      "description": "Vite dev server for the React frontend (http://localhost:5173).",
+      "command": "cd frontend && npm run dev"
+    }
+  ],
+  "ports": [
+    { "name": "frontend", "port": 5173 },
+    { "name": "backend-api", "port": 8080 },
+    { "name": "quant-grpc", "port": 50051 }
+  ]
+}
